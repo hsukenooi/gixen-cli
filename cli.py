@@ -309,17 +309,17 @@ def purge(dry_run: bool, yes: bool):
     siblings = find_sibling_cleanup_targets(snipes)
 
     # Fast path: no group siblings to clean. Preserve the original
-    # no-prompt, single-line behaviour.
+    # no-prompt, single-line behaviour (including no trailing period).
     if not siblings:
         if dry_run:
-            click.echo("Would purge completed snipes.")
+            click.echo("Would purge completed snipes")
             return
         try:
             client.purge_completed()
         except GixenError as e:
             click.echo(f"Error: {e}", err=True)
             sys.exit(1)
-        click.echo("Purged completed snipes.")
+        click.echo("Purged completed snipes")
         return
 
     completed_count = sum(
@@ -352,7 +352,7 @@ def purge(dry_run: bool, yes: bool):
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
-    click.echo("Purged completed snipes.")
+    click.echo("Purged completed snipes")
 
     removed: list[dict] = []
     failures: list[tuple[str, str]] = []

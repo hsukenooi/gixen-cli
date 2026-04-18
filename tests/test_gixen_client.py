@@ -730,7 +730,7 @@ class TestCliPurge:
             result = runner.invoke(cli, ["purge"])
 
         assert result.exit_code == 0
-        assert result.output == "Purged completed snipes.\n"
+        assert result.output == "Purged completed snipes\n"
         mock_client.purge_completed.assert_called_once()
         mock_client.remove_snipe.assert_not_called()
 
@@ -779,7 +779,7 @@ class TestCliPurge:
             call.args[0] for call in mock_client.remove_snipe.call_args_list
         ]
         assert removed_ids == ["222", "333"]
-        assert "Purged completed snipes." in result.output
+        assert "Purged completed snipes" in result.output
         assert "Removed 2 sibling snipe(s)" in result.output
 
     def test_dry_run_does_nothing(self):
