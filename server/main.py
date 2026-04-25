@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 
-from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError
+from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
 from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
@@ -48,12 +48,12 @@ _GIXEN_TO_DB_STATUS = {
 SYNC_INTERVAL = int(os.getenv("GIXEN_SYNC_INTERVAL", "600"))
 
 
-async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> None:
-    """Pull current Gixen state and update DB bid statuses."""
+async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
+    """Pull current Gixen state and update DB bid statuses. Returns snipes list."""
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
     except GixenError:
-        return
+        return []  # sync is best-effort; don't crash if Gixen is down
 
     now = datetime.now(timezone.utc).isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
@@ -82,6 +82,8 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> None:
     pending_bids = get_pending_bids(db)
     vanished = [b["item_id"] for b in pending_bids if b["item_id"] not in gixen_item_ids]
     mark_bids_purged(db, vanished)
+
+    return snipes
 
 
 async def _sync_loop() -> None:
@@ -341,25 +343,34 @@ async def api_remove_bid(item_id: str):
 async def api_purge(req: PurgeRequest):
     db = _get_db()
 
-    # Use _api_client (under lock) to avoid racing with _sync_loop on _sync_client
+    # 1. Sync first to capture any outstanding WON/LOST transitions;
+    #    reuse the snipes list for sibling detection (avoids a second Gixen call)
     async with _api_lock:
-        await _sync_gixen(db, _api_client)
+        gixen_snipes = await _sync_gixen(db, _api_client)
 
+    # 2. Detect siblings server-side (client may also pass explicit IDs)
+    server_siblings = find_sibling_cleanup_targets(gixen_snipes)
+    all_sibling_ids = list({s["item_id"] for s in server_siblings} | set(req.sibling_ids))
+
+    # 3. Collect completed bid item_ids before purging Gixen
     completed = db.execute(
         "SELECT item_id FROM bids WHERE status IN ('WON','LOST','ENDED','FAILED')"
     ).fetchall()
     completed_ids = [r["item_id"] for r in completed]
 
+    # 4. Purge completed on Gixen
     try:
         async with _api_lock:
             await asyncio.to_thread(_api_client.purge_completed)
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+    # 5. Mark completed bids as PURGED in DB
     mark_bids_purged(db, completed_ids)
 
+    # 6. Remove sibling snipes (best-effort)
     removed = 0
-    for sibling_id in req.sibling_ids:
+    for sibling_id in all_sibling_ids:
         try:
             async with _api_lock:
                 await asyncio.to_thread(_api_client.remove_snipe, sibling_id)

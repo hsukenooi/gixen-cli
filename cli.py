@@ -50,6 +50,9 @@ def _server_request(method: str, path: str, **kwargs):
     except requests.ConnectionError:
         click.echo("Error: Server unreachable. Is the gixen server running?", err=True)
         sys.exit(1)
+    except requests.Timeout:
+        click.echo("Error: Server timed out.", err=True)
+        sys.exit(1)
     except requests.HTTPError as e:
         detail = ""
         try:
@@ -368,25 +371,10 @@ def remove(item_id: str):
 def purge(dry_run: bool, yes: bool):
     """Remove completed snipes (and sibling snipes from groups with a win)."""
     if _server_url():
-        snipes = _server_request("get", "/api/snipes")
-        siblings = find_sibling_cleanup_targets(snipes)
-
-        if siblings:
-            click.echo(f"Will also remove {len(siblings)} sibling snipe(s):")
-            for s in siblings:
-                title = (s.get("title") or "")[:40]
-                click.echo(f"  group {s.get('snipe_group', '?')}: {s['item_id']} \"{title}\"")
-
         if dry_run:
-            click.echo("Dry run — no changes made.")
+            click.echo("Would purge completed snipes.")
             return
-
-        if siblings and not yes and not click.confirm("Continue?", default=False):
-            click.echo("Aborted.")
-            return
-
-        result = _server_request("post", "/api/purge",
-                                 json={"sibling_ids": [s["item_id"] for s in siblings]})
+        result = _server_request("post", "/api/purge", json={"sibling_ids": []})
         click.echo(f"Purged {result['purged_completed']} completed snipe(s)")
         if result["removed_siblings"]:
             click.echo(f"Removed {result['removed_siblings']} sibling snipe(s)")
