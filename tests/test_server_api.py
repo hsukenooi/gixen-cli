@@ -69,3 +69,51 @@ def test_upsert_comic_twice_updates(api):
 def test_upsert_comic_missing_required_field(api):
     r = api.post("/api/comics", json={"title": "X-Men", "issue": "1"})  # missing year
     assert r.status_code == 422
+
+
+def test_add_bid_no_comic(api):
+    r = api.post("/api/bids", json={
+        "item_id": "123456789",
+        "max_bid": 50.0,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["item_id"] == "123456789"
+    assert data["status"] == "PENDING"
+    api.mock_gixen.add_snipe.assert_called_once()
+
+
+def test_add_bid_with_comic_links_fmv(api):
+    r = api.post("/api/bids", json={
+        "item_id": "987654321",
+        "max_bid": 800.0,
+        "comic": "Amazing Spider-Man",
+        "issue": "300",
+        "year": 1988,
+        "grade": 9.2,
+        "fmv_low": 800.0,
+        "fmv_high": 1000.0,
+        "fmv_comps": 12,
+        "fmv_confidence": "high",
+        "fmv_notes": "",
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] is not None
+
+
+def test_add_bid_invalid_item_id(api):
+    r = api.post("/api/bids", json={"item_id": "abc", "max_bid": 50.0})
+    assert r.status_code == 422
+
+
+def test_add_bid_negative_max_bid(api):
+    r = api.post("/api/bids", json={"item_id": "123456789", "max_bid": -10.0})
+    assert r.status_code == 422
+
+
+def test_add_bid_gixen_error_returns_503(api):
+    from gixen_client import GixenError
+    api.mock_gixen.add_snipe.side_effect = GixenError("Gixen down")
+    r = api.post("/api/bids", json={"item_id": "111222333", "max_bid": 50.0})
+    assert r.status_code == 503
