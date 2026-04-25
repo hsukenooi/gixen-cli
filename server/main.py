@@ -26,7 +26,7 @@ from server.db import (
 _db: Optional[sqlite3.Connection] = None
 _api_client: Optional[GixenClient] = None
 _sync_client: Optional[GixenClient] = None
-_api_lock: Optional[asyncio.Lock] = None
+_api_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _get_db() -> sqlite3.Connection:
@@ -39,7 +39,6 @@ def _get_db() -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 _GIXEN_TO_DB_STATUS = {
-    "SCHEDULED": "PENDING",
     "WON": "WON",
     "LOST": "LOST",
     "FAILED": "FAILED",
@@ -107,7 +106,7 @@ async def lifespan(app: FastAPI):
     _api_lock = asyncio.Lock()
 
     sync_task = None
-    if os.getenv("GIXEN_SYNC_ENABLED", "true") == "true":
+    if os.getenv("GIXEN_SYNC_ENABLED", "true") != "false":
         sync_task = asyncio.create_task(_sync_loop())
 
     yield
@@ -342,7 +341,9 @@ async def api_remove_bid(item_id: str):
 async def api_purge(req: PurgeRequest):
     db = _get_db()
 
-    await _sync_gixen(db, _sync_client)
+    # Use _api_client (under lock) to avoid racing with _sync_loop on _sync_client
+    async with _api_lock:
+        await _sync_gixen(db, _api_client)
 
     completed = db.execute(
         "SELECT item_id FROM bids WHERE status IN ('WON','LOST','ENDED','FAILED')"
