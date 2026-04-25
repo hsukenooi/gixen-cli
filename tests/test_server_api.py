@@ -169,3 +169,35 @@ def test_get_snipes_gixen_error_returns_503(api):
     api.mock_gixen.list_snipes.side_effect = GixenError("Gixen down")
     r = api.get("/api/snipes")
     assert r.status_code == 503
+
+
+def test_edit_bid(api):
+    api.post("/api/bids", json={"item_id": "200000001", "max_bid": 50.0})
+    r = api.patch("/api/bids/200000001", json={"max_bid": 75.0, "bid_offset": 10, "snipe_group": 0})
+    assert r.status_code == 200
+    assert r.json()["max_bid"] == 75.0
+    api.mock_gixen.modify_snipe.assert_called_once()
+
+
+def test_edit_bid_not_found(api):
+    from gixen_client import GixenSnipeNotFoundError
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("not found")
+    r = api.patch("/api/bids/999999999", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 404
+
+
+def test_remove_bid(api):
+    api.post("/api/bids", json={"item_id": "300000001", "max_bid": 50.0})
+    r = api.delete("/api/bids/300000001")
+    assert r.status_code == 200
+    api.mock_gixen.remove_snipe.assert_called_once()
+
+
+def test_purge(api):
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+    data = r.json()
+    assert "purged_completed" in data
+    assert "removed_siblings" in data
+    api.mock_gixen.list_snipes.assert_called()
+    api.mock_gixen.purge_completed.assert_called_once()
