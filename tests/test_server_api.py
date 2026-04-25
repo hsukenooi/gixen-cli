@@ -201,3 +201,30 @@ def test_purge(api):
     assert "removed_siblings" in data
     api.mock_gixen.list_snipes.assert_called()
     api.mock_gixen.purge_completed.assert_called_once()
+
+
+def test_sync_captures_won_status(api):
+    """Sync updates bid status when Gixen reports WON."""
+    # Add a bid so there's a DB record
+    api.post("/api/bids", json={"item_id": "400000001", "max_bid": 50.0})
+
+    # Mock Gixen returning the item as WON
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "400000001",
+        "title": "Test",
+        "max_bid": "50.00 USD",
+        "current_bid": "42.00 USD",
+        "status": "WON",
+        "time_to_end": "ENDED",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "xyz",
+    }]
+
+    # Trigger sync via purge (which calls _sync_gixen internally).
+    # _sync_gixen sets the bid to WON; purge then marks it PURGED and
+    # returns purged_completed >= 1.
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.json()["purged_completed"] >= 1
