@@ -3,7 +3,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -228,3 +229,99 @@ def test_sync_captures_won_status(api):
     # returns purged_completed >= 1.
     r = api.post("/api/purge", json={"sibling_ids": []})
     assert r.json()["purged_completed"] >= 1
+
+
+def test_edit_bid_non_numeric_item_id(api):
+    r = api.patch("/api/bids/abc", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 422
+
+
+def test_remove_bid_non_numeric_item_id(api):
+    r = api.delete("/api/bids/abc")
+    assert r.status_code == 422
+
+
+def test_edit_bid_not_in_db_returns_synthetic(api):
+    """PATCH succeeds on Gixen but item has no DB row — returns 3-key synthetic response."""
+    r = api.patch("/api/bids/999000001", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "PENDING"
+    assert set(data.keys()) == {"item_id", "max_bid", "status"}
+
+
+def test_purge_gixen_error_returns_503(api):
+    from gixen_client import GixenError
+    api.mock_gixen.purge_completed.side_effect = GixenError("Gixen down")
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 503
+
+
+def test_upsert_comic_invalid_confidence(api):
+    r = api.post("/api/comics", json={
+        "title": "X-Men", "issue": "1", "year": 1963,
+        "fmv_confidence": "very_high",
+    })
+    assert r.status_code == 422
+
+
+def test_remove_bid_gixen_error_returns_503(api):
+    from gixen_client import GixenError
+    api.mock_gixen.remove_snipe.side_effect = GixenError("network error")
+    api.post("/api/bids", json={"item_id": "700000001", "max_bid": 50.0})
+    r = api.delete("/api/bids/700000001")
+    assert r.status_code == 503
+
+
+def test_edit_bid_gixen_error_returns_503(api):
+    from gixen_client import GixenError
+    api.mock_gixen.modify_snipe.side_effect = GixenError("network error")
+    r = api.patch("/api/bids/800000001", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 503
+
+
+def test_purge_removes_siblings(api):
+    """Sibling loop executes when a group has a WON snipe."""
+    api.post("/api/bids", json={"item_id": "500000001", "max_bid": 50.0})
+    api.mock_gixen.list_snipes.return_value = [
+        {
+            "item_id": "500000001", "status": "WON", "snipe_group": "1",
+            "title": "Comic A", "max_bid": "50.00 USD", "current_bid": "45.00 USD",
+            "time_to_end": "ENDED", "seller": "s",
+            "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "a1",
+        },
+        {
+            "item_id": "500000002", "status": "SCHEDULED", "snipe_group": "1",
+            "title": "Comic A alt", "max_bid": "50.00 USD", "current_bid": "0.00 USD",
+            "time_to_end": "5h 0m", "seller": "s",
+            "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "b2",
+        },
+    ]
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+    assert r.json()["removed_siblings"] == 1
+    api.mock_gixen.remove_snipe.assert_called_once_with("500000002")
+
+
+def test_purge_sibling_failure_swallowed(api):
+    """GixenError from sibling removal is swallowed; response still 200."""
+    from gixen_client import GixenError
+    api.post("/api/bids", json={"item_id": "600000001", "max_bid": 50.0})
+    api.mock_gixen.list_snipes.return_value = [
+        {
+            "item_id": "600000001", "status": "WON", "snipe_group": "2",
+            "title": "Comic B", "max_bid": "50.00 USD", "current_bid": "40.00 USD",
+            "time_to_end": "ENDED", "seller": "s",
+            "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "c1",
+        },
+        {
+            "item_id": "600000002", "status": "SCHEDULED", "snipe_group": "2",
+            "title": "Comic B alt", "max_bid": "50.00 USD", "current_bid": "0.00 USD",
+            "time_to_end": "5h 0m", "seller": "s",
+            "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "d2",
+        },
+    ]
+    api.mock_gixen.remove_snipe.side_effect = GixenError("Gixen down")
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+    assert r.json()["removed_siblings"] == 0

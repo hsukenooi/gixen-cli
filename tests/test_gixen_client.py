@@ -1152,3 +1152,69 @@ def test_cli_server_unreachable_shows_error(monkeypatch):
             result = runner.invoke(cli_app, ["add", "123456789", "50.00"])
             assert result.exit_code != 0
             assert "unreachable" in result.output.lower() or "error" in result.output.lower()
+
+
+def test_cli_edit_patches_server(monkeypatch):
+    """When GIXEN_SERVER_URL is set, `edit` sends PATCH to /api/bids/{item_id}."""
+    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+
+    runner = CliRunner()
+    with patch("cli.requests") as mock_req:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"item_id": "123456789", "max_bid": 75.0, "status": "PENDING"}
+        mock_req.patch.return_value = mock_resp
+
+        result = runner.invoke(cli_app, ["edit", "123456789", "75.00"])
+        assert result.exit_code == 0
+        mock_req.patch.assert_called_once()
+        call_url = mock_req.patch.call_args[0][0]
+        assert "/api/bids/123456789" in call_url
+
+
+def test_cli_remove_deletes_server(monkeypatch):
+    """When GIXEN_SERVER_URL is set, `remove` sends DELETE to /api/bids/{item_id}."""
+    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+
+    runner = CliRunner()
+    with patch("cli.requests") as mock_req:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"item_id": "123456789", "status": "PURGED"}
+        mock_req.delete.return_value = mock_resp
+
+        result = runner.invoke(cli_app, ["remove", "123456789"])
+        assert result.exit_code == 0
+        mock_req.delete.assert_called_once()
+        call_url = mock_req.delete.call_args[0][0]
+        assert "/api/bids/123456789" in call_url
+
+
+def test_cli_purge_posts_to_server(monkeypatch):
+    """When GIXEN_SERVER_URL is set, `purge` sends POST to /api/purge."""
+    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+
+    runner = CliRunner()
+    with patch("cli.requests") as mock_req:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"purged_completed": 2, "removed_siblings": 0}
+        mock_req.post.return_value = mock_resp
+
+        result = runner.invoke(cli_app, ["purge"])
+        assert result.exit_code == 0
+        mock_req.post.assert_called_once()
+        call_url = mock_req.post.call_args[0][0]
+        assert "/api/purge" in call_url
+
+
+def test_cli_purge_dry_run_server_mode(monkeypatch):
+    """purge --dry-run in server mode prints a message and makes no HTTP request."""
+    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+
+    runner = CliRunner()
+    with patch("cli.requests") as mock_req:
+        result = runner.invoke(cli_app, ["purge", "--dry-run"])
+        assert result.exit_code == 0
+        assert "would purge" in result.output.lower()
+        mock_req.post.assert_not_called()

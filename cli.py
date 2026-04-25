@@ -40,7 +40,7 @@ def _server_url() -> str | None:
     return os.getenv("GIXEN_SERVER_URL", "").rstrip("/") or None
 
 
-def _server_request(method: str, path: str, **kwargs):
+def _server_request(method: str, path: str, **kwargs) -> dict | list:
     """Make a request to the gixen server. Raises SystemExit on failure."""
     url = f"{_server_url()}{path}"
     try:
@@ -54,12 +54,15 @@ def _server_request(method: str, path: str, **kwargs):
         click.echo("Error: Server timed out.", err=True)
         sys.exit(1)
     except requests.HTTPError as e:
+        status_code = "unknown"
         detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        click.echo(f"Error: Server returned {e.response.status_code}: {detail}", err=True)
+        if e.response is not None:
+            status_code = e.response.status_code
+            try:
+                detail = e.response.json().get("detail", "")
+            except (ValueError, AttributeError):
+                pass
+        click.echo(f"Error: Server returned {status_code}: {detail}", err=True)
         sys.exit(1)
 
 
@@ -197,10 +200,11 @@ def _calc_diff(max_bid: str, winning_bid: str) -> str:
 @click.option("--fmv-high", default=None, type=float, help="FMV range high end")
 @click.option("--fmv-comps", default=None, type=int, help="Number of comps used")
 @click.option("--fmv-confidence", default=None, help="FMV confidence: high/medium/low")
+@click.option("--fmv-notes", default=None, help="FMV notes")
 def add(item_id: str, max_bid: str, offset: int, group: int,
         comic: str | None, issue: str | None, year: int | None, grade: float | None,
         fmv_low: float | None, fmv_high: float | None,
-        fmv_comps: int | None, fmv_confidence: str | None):
+        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -220,6 +224,7 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
                 "comic": comic, "issue": issue, "year": year,
                 "grade": grade, "fmv_low": fmv_low, "fmv_high": fmv_high,
                 "fmv_comps": fmv_comps, "fmv_confidence": fmv_confidence,
+                "fmv_notes": fmv_notes,
             })
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)

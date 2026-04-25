@@ -13,10 +13,10 @@ chmod 700 "$SERVER_DIR"
 
 if [ ! -f "$SERVER_DIR/.env" ]; then
   echo "==> Creating $SERVER_DIR/.env (fill in credentials)"
-  cat > "$SERVER_DIR/.env" <<'ENV'
+  cat > "$SERVER_DIR/.env" <<ENV
 GIXEN_USERNAME=your_username_here
 GIXEN_PASSWORD=your_password_here
-DB_PATH=/Users/YOURUSERNAME/.gixen-server/db.sqlite
+DB_PATH=$HOME/.gixen-server/db.sqlite
 GIXEN_SYNC_ENABLED=true
 GIXEN_SYNC_INTERVAL=600
 ENV

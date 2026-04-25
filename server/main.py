@@ -1,5 +1,6 @@
 """Gixen backend server — FastAPI app with SQLite storage and Gixen proxy."""
 import asyncio
+import logging
 import os
 import re
 import sqlite3
@@ -7,8 +8,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 
@@ -19,14 +20,16 @@ from server.db import (
     get_pending_bids, mark_bids_purged,
 )
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # App state
 # ---------------------------------------------------------------------------
 
-_db: Optional[sqlite3.Connection] = None
-_api_client: Optional[GixenClient] = None
-_sync_client: Optional[GixenClient] = None
-_api_lock: asyncio.Lock = asyncio.Lock()
+_db: sqlite3.Connection | None = None
+_api_client: GixenClient | None = None
+_sync_client: GixenClient | None = None
+_api_lock: asyncio.Lock | None = None
 
 
 def _get_db() -> sqlite3.Connection:
@@ -38,12 +41,7 @@ def _get_db() -> sqlite3.Connection:
 # Sync helpers (defined before lifespan so api_purge can reference them)
 # ---------------------------------------------------------------------------
 
-_GIXEN_TO_DB_STATUS = {
-    "WON": "WON",
-    "LOST": "LOST",
-    "FAILED": "FAILED",
-    "ENDED": "ENDED",
-}
+_TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "ENDED"})
 
 SYNC_INTERVAL = int(os.getenv("GIXEN_SYNC_INTERVAL", "600"))
 
@@ -52,7 +50,8 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     """Pull current Gixen state and update DB bid statuses. Returns snipes list."""
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
-    except GixenError:
+    except GixenError as e:
+        logger.warning("_sync_gixen: GixenError (suppressed): %s", e)
         return []  # sync is best-effort; don't crash if Gixen is down
 
     now = datetime.now(timezone.utc).isoformat()
@@ -60,8 +59,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 
     for snipe in snipes:
         gixen_status = snipe.get("status", "")
-        db_status = _GIXEN_TO_DB_STATUS.get(gixen_status)
-        if db_status and db_status != "PENDING":
+        if gixen_status in _TERMINAL_GIXEN_STATUSES:
             current_bid = snipe.get("current_bid", "")
             winning_bid = None
             if current_bid:
@@ -69,7 +67,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                     winning_bid = float(current_bid.split()[0])
                 except (ValueError, IndexError):
                     pass
-            update_bid_status(db, snipe["item_id"], db_status, winning_bid, now)
+            update_bid_status(db, snipe["item_id"], gixen_status, winning_bid, now)
 
         if snipe.get("seller"):
             db.execute(
@@ -87,10 +85,13 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 
 
 async def _sync_loop() -> None:
-    await asyncio.sleep(SYNC_INTERVAL)
     while True:
-        db = _get_db()
-        await _sync_gixen(db, _sync_client)
+        try:
+            if _sync_client is not None:
+                db = _get_db()
+                await _sync_gixen(db, _sync_client)
+        except Exception:
+            logger.exception("_sync_loop: unexpected error, continuing")
         await asyncio.sleep(SYNC_INTERVAL)
 
 
@@ -101,6 +102,8 @@ async def _sync_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db, _api_client, _sync_client, _api_lock
+    if env_file := os.getenv("ENV_FILE"):
+        load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
     _api_client = GixenClient()
@@ -115,7 +118,9 @@ async def lifespan(app: FastAPI):
 
     if sync_task:
         sync_task.cancel()
-    _db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if row and row[0]:
+        logger.warning("WAL checkpoint incomplete: busy=%s", row[0])
     _db.close()
 
 
@@ -129,16 +134,16 @@ class UpsertComicRequest(BaseModel):
     title: str
     issue: str
     year: int
-    grade: Optional[float] = None
-    fmv_low: Optional[float] = None
-    fmv_high: Optional[float] = None
-    fmv_comps: Optional[int] = None
-    fmv_confidence: Optional[str] = None
-    fmv_notes: Optional[str] = None
+    grade: float | None = None
+    fmv_low: float | None = None
+    fmv_high: float | None = None
+    fmv_comps: int | None = None
+    fmv_confidence: str | None = None
+    fmv_notes: str | None = None
 
     @field_validator("fmv_confidence")
     @classmethod
-    def validate_confidence(cls, v):
+    def validate_confidence(cls, v: str | None) -> str | None:
         if v is not None and v not in ("high", "medium", "low"):
             raise ValueError("fmv_confidence must be high, medium, or low")
         return v
@@ -149,28 +154,35 @@ class AddBidRequest(BaseModel):
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
-    comic: Optional[str] = None
-    issue: Optional[str] = None
-    year: Optional[int] = None
-    grade: Optional[float] = None
-    fmv_low: Optional[float] = None
-    fmv_high: Optional[float] = None
-    fmv_comps: Optional[int] = None
-    fmv_confidence: Optional[str] = None
-    fmv_notes: Optional[str] = None
+    comic: str | None = None
+    issue: str | None = None
+    year: int | None = None
+    grade: float | None = None
+    fmv_low: float | None = None
+    fmv_high: float | None = None
+    fmv_comps: int | None = None
+    fmv_confidence: str | None = None
+    fmv_notes: str | None = None
 
     @field_validator("item_id")
     @classmethod
-    def item_id_numeric(cls, v):
+    def item_id_numeric(cls, v: str) -> str:
         if not re.match(r"^\d+$", v):
             raise ValueError("item_id must be numeric")
         return v
 
     @field_validator("max_bid")
     @classmethod
-    def max_bid_positive(cls, v):
+    def max_bid_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("max_bid must be positive")
+        return v
+
+    @field_validator("fmv_confidence")
+    @classmethod
+    def validate_confidence(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("high", "medium", "low"):
+            raise ValueError("fmv_confidence must be high, medium, or low")
         return v
 
 
@@ -181,7 +193,7 @@ class EditBidRequest(BaseModel):
 
     @field_validator("max_bid")
     @classmethod
-    def max_bid_positive(cls, v):
+    def max_bid_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("max_bid must be positive")
         return v
@@ -189,6 +201,14 @@ class EditBidRequest(BaseModel):
 
 class PurgeRequest(BaseModel):
     sibling_ids: list[str] = []
+
+    @field_validator("sibling_ids")
+    @classmethod
+    def validate_sibling_ids(cls, v: list[str]) -> list[str]:
+        for item_id in v:
+            if not re.match(r"^\d+$", item_id):
+                raise ValueError(f"sibling_ids contains non-numeric value: {item_id}")
+        return v
 
 
 # ---------------------------------------------------------------------------

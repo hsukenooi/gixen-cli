@@ -1,7 +1,7 @@
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 DB_PATH = Path.home() / ".gixen-server" / "db.sqlite"
 
@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS bids (
     added_at        TEXT DEFAULT (datetime('now')),
     resolved_at     TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 """
 
 
@@ -46,8 +48,13 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
-    conn.executescript(_SCHEMA)
-    conn.commit()
+    try:
+        conn.executescript(_SCHEMA)
+        conn.commit()
+    except Exception:
+        conn.close()
+        raise
+    os.chmod(path, 0o600)
     return conn
 
 
@@ -56,12 +63,12 @@ def upsert_comic(
     title: str,
     issue: str,
     year: int,
-    grade: Optional[float],
-    fmv_low: Optional[float],
-    fmv_high: Optional[float],
-    fmv_comps: Optional[int],
-    fmv_confidence: Optional[str],
-    fmv_notes: Optional[str],
+    grade: float | None,
+    fmv_low: float | None,
+    fmv_high: float | None,
+    fmv_comps: int | None,
+    fmv_confidence: str | None,
+    fmv_notes: str | None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -92,10 +99,10 @@ def insert_bid(
     conn: sqlite3.Connection,
     item_id: str,
     max_bid: float,
-    comic_id: Optional[int],
+    comic_id: int | None,
     bid_offset: int,
     snipe_group: int,
-    seller: Optional[str],
+    seller: str | None,
 ) -> int:
     cur = conn.execute(
         """
@@ -108,7 +115,7 @@ def insert_bid(
     return cur.lastrowid
 
 
-def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> Optional[sqlite3.Row]:
+def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM bids WHERE item_id=? ORDER BY id DESC LIMIT 1",
         (item_id,),
@@ -133,8 +140,8 @@ def update_bid_status(
     conn: sqlite3.Connection,
     item_id: str,
     status: str,
-    winning_bid: Optional[float] = None,
-    resolved_at: Optional[str] = None,
+    winning_bid: float | None = None,
+    resolved_at: str | None = None,
 ) -> None:
     conn.execute(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
@@ -152,11 +159,11 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     conn.commit()
 
 
-def get_all_bids(conn: sqlite3.Connection) -> list:
+def get_all_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM bids ORDER BY added_at DESC").fetchall()
 
 
-def get_pending_bids(conn: sqlite3.Connection) -> list:
+def get_pending_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM bids WHERE status='PENDING'").fetchall()
 
 
@@ -164,6 +171,7 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     if not item_ids:
         return
     now = datetime.now(timezone.utc).isoformat()
+    # placeholders contains only '?' chars — no user data is interpolated
     placeholders = ",".join("?" * len(item_ids))
     conn.execute(
         f"UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id IN ({placeholders})",
