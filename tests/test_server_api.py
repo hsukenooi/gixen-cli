@@ -117,3 +117,55 @@ def test_add_bid_gixen_error_returns_503(api):
     api.mock_gixen.add_snipe.side_effect = GixenError("Gixen down")
     r = api.post("/api/bids", json={"item_id": "111222333", "max_bid": 50.0})
     assert r.status_code == 503
+
+
+def test_get_snipes_empty(api):
+    api.mock_gixen.list_snipes.return_value = []
+    r = api.get("/api/snipes")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_snipes_merges_fmv(api):
+    # Add a bid with comic context first
+    api.post("/api/bids", json={
+        "item_id": "555666777",
+        "max_bid": 60.0,
+        "comic": "Hulk",
+        "issue": "181",
+        "year": 1974,
+        "grade": 9.0,
+        "fmv_low": 50.0,
+        "fmv_high": 70.0,
+        "fmv_comps": 8,
+        "fmv_confidence": "high",
+        "fmv_notes": "",
+    })
+    # Mock Gixen returning the same item
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "555666777",
+        "title": "Incredible Hulk #181",
+        "max_bid": "60.00 USD",
+        "current_bid": "45.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "5h 0m",
+        "seller": "comicseller",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "abc123",
+    }]
+    r = api.get("/api/snipes")
+    assert r.status_code == 200
+    snipes = r.json()
+    assert len(snipes) == 1
+    assert snipes[0]["item_id"] == "555666777"
+    assert snipes[0]["fmv_low"] == 50.0
+    assert snipes[0]["fmv_confidence"] == "high"
+
+
+def test_get_snipes_gixen_error_returns_503(api):
+    from gixen_client import GixenError
+    api.mock_gixen.list_snipes.side_effect = GixenError("Gixen down")
+    r = api.get("/api/snipes")
+    assert r.status_code == 503
