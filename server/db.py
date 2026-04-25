@@ -145,7 +145,7 @@ def update_bid_status(
 def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id=? AND status='PENDING'",
+        "UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
         (now, item_id),
     )
     conn.commit()

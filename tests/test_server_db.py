@@ -109,6 +109,14 @@ def test_delete_bid_marks_purged(db):
     assert row["status"] == "PURGED"
 
 
+def test_delete_bid_marks_won_bid_purged(db):
+    insert_bid(db, "666777888", 50.0, None, 6, 0, "s")
+    update_bid_status(db, "666777888", status="WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
+    delete_bid(db, "666777888")
+    row = get_bid_by_item_id(db, "666777888")
+    assert row["status"] == "PURGED"
+
+
 def test_get_all_bids_returns_list(db):
     insert_bid(db, "100000001", 10.0, None, 6, 0, "s")
     insert_bid(db, "100000002", 20.0, None, 6, 0, "s")
