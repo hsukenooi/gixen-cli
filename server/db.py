@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS bids (
     max_bid         REAL NOT NULL,
     bid_offset      INTEGER DEFAULT 6,
     snipe_group     INTEGER DEFAULT 0,
-    status          TEXT DEFAULT 'PENDING',
+    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
     winning_bid     REAL,
     seller          TEXT,
     auction_end_at  TEXT,
@@ -44,6 +44,7 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     conn.commit()
