@@ -663,5 +663,48 @@ def bid_now(item_id: str, max_bid: float, dry_run: bool):
         sys.exit(1)
 
 
+# ─── fmv ──────────────────────────────────────────────────────────────────────
+
+@cli.command("fmv")
+@click.option("--batch", "batch_path", type=click.Path(exists=True),
+              help="Path to JSON batch of books to value (or '-' for stdin).")
+@click.option("--out", "out_path", type=click.Path(),
+              help="Write structured JSON output to this path ('-' for stdout).")
+@click.option("--max-age-days", type=float, default=7.0,
+              help="Reuse FMVs already in the Gixen DB if fmv_updated_at is within N days. Default 7.")
+@click.option("--force", is_flag=True,
+              help="Bypass both the SerpApi response cache and the DB FMV cache; recompute everything.")
+@click.option("--ebay-cli-path", envvar="EBAY_CLI_PATH",
+              default="~/Projects/ebay-cli",
+              help="Path to ebay-cli repo (override with EBAY_CLI_PATH env).")
+@click.option("--quiet", is_flag=True, help="Suppress the human table on stdout.")
+def fmv_cmd(batch_path: str | None, out_path: str | None,
+            max_age_days: float, force: bool, ebay_cli_path: str, quiet: bool):
+    """Compute fair market value for a batch of comics.
+
+    Pipeline per book:
+      1. (skip-if-cached) GET /api/comics?locg_id=...&grade=...&max_age_days=N
+         to reuse a recent DB FMV
+      2. Shell out to ebay-cli sold_comps.py for any books still needing comps
+      3. Run IQR + quartiles + confidence rubric on the comp pool
+      4. POST /api/comics to upsert the FMV (stamps fmv_updated_at)
+
+    Input batch JSON shape:
+      [{"item_id": "...", "title": "...", "issue": "...", "year": 1984,
+        "grade": 8.0, "locg_id": 1081721, "locg_variant_id": null,
+        "publisher": "dark horse", "notes": "..."}, ...]
+    """
+    import fmv_runner
+    fmv_runner.run(
+        batch_path=batch_path,
+        out_path=out_path,
+        max_age_days=max_age_days,
+        force=force,
+        ebay_cli_path=os.path.expanduser(ebay_cli_path),
+        quiet=quiet,
+        server_url=_server_url(),
+    )
+
+
 if __name__ == "__main__":
     cli()
