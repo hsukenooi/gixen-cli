@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path.home() / ".gixen-server" / "db.sqlite"
@@ -125,7 +125,10 @@ def upsert_comic(
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
 ) -> int:
-    now = datetime.now(timezone.utc).isoformat()
+    # Stamp fmv_updated_at only when an FMV is actually being recorded.
+    # Otherwise leave it NULL so the freshness predicate in list_comics()
+    # (max_age_days) doesn't return rows that have a timestamp but no FMV.
+    now = datetime.now(timezone.utc).isoformat() if fmv_low is not None else None
     conn.execute(
         """
         INSERT INTO comics (title, issue, year, grade, fmv_low, fmv_high,
@@ -325,7 +328,17 @@ def list_comics(
     issue: str | None = None,
     year: int | None = None,
     grade: float | None = None,
+    locg_id: int | None = None,
+    max_age_days: float | None = None,
 ) -> list[sqlite3.Row]:
+    """List comics matching the given filters.
+
+    locg_id: filter to one canonical issue (used by /comic:fmv to look up
+        a fresh FMV by LOCG ID + grade without juggling title spellings).
+    max_age_days: if set, only return rows where fmv_updated_at is within
+        the last N days. Stale rows are excluded so callers can't
+        accidentally reuse outdated FMVs.
+    """
     clauses, params = [], []
     if title is not None:
         clauses.append("LOWER(title) = LOWER(?)")
@@ -339,6 +352,14 @@ def list_comics(
     if grade is not None:
         clauses.append("grade = ?")
         params.append(grade)
+    if locg_id is not None:
+        clauses.append("locg_id = ?")
+        params.append(locg_id)
+    if max_age_days is not None:
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=max_age_days)).isoformat()
+        clauses.append("fmv_updated_at IS NOT NULL AND fmv_updated_at >= ?")
+        params.append(cutoff)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     return conn.execute(
         f"SELECT * FROM comics {where} ORDER BY id",

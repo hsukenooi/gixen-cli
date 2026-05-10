@@ -1,5 +1,6 @@
 """Unit tests for server/db.py — all use tmp_path, no disk side effects."""
 import sqlite3
+from datetime import datetime, timedelta, timezone
 import pytest
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from server.db import (
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged,
     link_comic_to_bid, get_comics_for_bid, get_primary_comic_for_bid,
+    list_comics,
 )
 
 
@@ -383,3 +385,82 @@ def test_migration_backfill_is_idempotent(tmp_path):
     ).fetchone()
     conn2.close()
     assert rows["n"] == 1
+
+
+# ─── list_comics — locg_id and max_age_days filters ──────────────────────────
+
+def test_list_comics_filters_by_locg_id(db):
+    """A locg_id lookup returns rows for that canonical issue, regardless of
+    title spelling. This is the lookup gixen-cli fmv uses for cache reuse."""
+    upsert_comic(db, "Amazing Spider-Man", "300", 1988, 9.2,
+                 800, 1000, 12, "high", "", locg_id=6977652)
+    upsert_comic(db, "Hulk", "181", 1974, 9.0,
+                 50, 70, 10, "high", "", locg_id=12345)
+    rows = list_comics(db, locg_id=6977652)
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Amazing Spider-Man"
+
+
+def test_list_comics_locg_id_plus_grade(db):
+    """The fmv-cache lookup pattern: locg_id + grade pinpoints one row."""
+    upsert_comic(db, "Hulk", "181", 1974, 9.0,
+                 50, 70, 10, "high", "", locg_id=12345)
+    upsert_comic(db, "Hulk", "181", 1974, 9.2,
+                 100, 130, 8, "high", "", locg_id=12345)
+    rows = list_comics(db, locg_id=12345, grade=9.0)
+    assert len(rows) == 1
+    assert rows[0]["grade"] == 9.0
+
+
+def test_list_comics_max_age_excludes_stale(db):
+    """A row whose fmv_updated_at is older than the cutoff is excluded."""
+    upsert_comic(db, "Hulk", "181", 1974, 9.0,
+                 50, 70, 10, "high", "")
+    # Backdate fmv_updated_at to 30 days ago
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    db.execute("UPDATE comics SET fmv_updated_at = ?", (old,))
+    db.commit()
+
+    rows = list_comics(db, max_age_days=7)
+    assert rows == []  # 30 days > 7-day cutoff
+    rows = list_comics(db, max_age_days=60)
+    assert len(rows) == 1  # 30 days < 60-day cutoff
+
+
+def test_list_comics_max_age_keeps_fresh(db):
+    """A row whose fmv_updated_at is within the cutoff is included."""
+    upsert_comic(db, "Hulk", "181", 1974, 9.0,
+                 50, 70, 10, "high", "")
+    rows = list_comics(db, max_age_days=7)
+    assert len(rows) == 1
+
+
+def test_list_comics_max_age_excludes_null_fmv_updated_at(db):
+    """A comic with no FMV (fmv_updated_at IS NULL) doesn't satisfy the
+    freshness predicate. Important: we don't want to return a row with no
+    FMV data and pretend it's a cache hit."""
+    # Insert a comic with all-None FMV fields. upsert_comic always sets
+    # fmv_updated_at when fmv_low is provided, so we explicitly pass None.
+    upsert_comic(db, "Hulk", "181", 1974, 9.0,
+                 None, None, None, None, None)
+    # Confirm fmv_updated_at didn't get touched
+    row = db.execute("SELECT fmv_updated_at FROM comics").fetchone()
+    assert row["fmv_updated_at"] is None
+
+    rows = list_comics(db, max_age_days=365)
+    assert rows == []
+
+
+def test_list_comics_combines_locg_grade_and_freshness(db):
+    """The end-to-end FMV-cache lookup: locg_id + grade + max_age_days."""
+    upsert_comic(db, "ASM", "300", 1988, 9.2,
+                 800, 1000, 12, "high", "", locg_id=6977652)
+    rows = list_comics(db, locg_id=6977652, grade=9.2, max_age_days=7)
+    assert len(rows) == 1
+
+    # Same lookup with a tighter freshness window after backdating
+    old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    db.execute("UPDATE comics SET fmv_updated_at = ?", (old,))
+    db.commit()
+    rows = list_comics(db, locg_id=6977652, grade=9.2, max_age_days=7)
+    assert rows == []
