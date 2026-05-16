@@ -823,7 +823,28 @@ async def api_add_bid(req: AddBidRequest):
         seller=None,
     )
     row = db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
-    return dict(row)
+    result = dict(row)
+
+    # Defense-in-depth: surface a warning if we linked this bid to a comic
+    # record that has no FMV. The dashboard renders '—' for these rows, so
+    # callers (CLI, skill agents, direct API hits) should know to backfill.
+    if comic_id is not None:
+        comic_row = db.execute(
+            "SELECT title, issue, fmv_low FROM comics WHERE id=?", (comic_id,)
+        ).fetchone()
+        if comic_row is not None and comic_row["fmv_low"] is None:
+            logger.warning(
+                "bid added with no FMV for item_id=%s comic_id=%s — "
+                "dashboard will render '—' for this row.",
+                req.item_id, comic_id,
+            )
+            result["warning"] = (
+                f"comic record for {comic_row['title']} #{comic_row['issue']} "
+                f"has no FMV (fmv_low IS NULL). Dashboard will render '—'. "
+                f"Run /comic:fmv or POST /api/comics with FMV fields to fix."
+            )
+
+    return result
 
 
 @app.get("/api/snipes")

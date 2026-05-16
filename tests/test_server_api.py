@@ -144,6 +144,70 @@ def test_add_bid_with_comic_links_fmv(api):
     assert data["comic_id"] is not None
 
 
+def test_add_bid_with_fmv_no_warning(api, caplog):
+    """Bid linked to a comic that has FMV → no warning field, no logger.warning."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="server.main")
+    r = api.post("/api/bids", json={
+        "item_id": "987654322",
+        "max_bid": 800.0,
+        "comic": "Amazing Spider-Man",
+        "issue": "300",
+        "year": 1988,
+        "grade": 9.2,
+        "fmv_low": 800.0,
+        "fmv_high": 1000.0,
+        "fmv_comps": 12,
+        "fmv_confidence": "high",
+        "fmv_notes": "",
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] is not None
+    assert "warning" not in data
+    assert not any("no FMV" in rec.message for rec in caplog.records)
+
+
+def test_add_bid_with_null_fmv_emits_warning(api, caplog):
+    """Bid linked to a comic with NULL fmv_low → response has warning field,
+    logger.warning was called."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="server.main")
+    r = api.post("/api/bids", json={
+        "item_id": "987654323",
+        "max_bid": 50.0,
+        "comic": "Mystery Comic",
+        "issue": "1",
+        "year": 1990,
+        "grade": 9.0,
+        # No fmv_low, fmv_high — comic record will have NULL FMV
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] is not None
+    assert "warning" in data
+    assert "Mystery Comic" in data["warning"]
+    assert "#1" in data["warning"]
+    assert "fmv_low IS NULL" in data["warning"]
+    # logger.warning was called with the no-FMV message
+    assert any("no FMV" in rec.message for rec in caplog.records)
+
+
+def test_add_bid_without_comic_no_warning(api, caplog):
+    """Bid with no --comic flag (comic_id resolves to None) → no warning."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="server.main")
+    r = api.post("/api/bids", json={
+        "item_id": "987654324",
+        "max_bid": 50.0,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data.get("comic_id") is None
+    assert "warning" not in data
+    assert not any("no FMV" in rec.message for rec in caplog.records)
+
+
 def test_add_bid_invalid_item_id(api):
     r = api.post("/api/bids", json={"item_id": "abc", "max_bid": 50.0})
     assert r.status_code == 422

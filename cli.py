@@ -260,9 +260,11 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
                 "fmv_notes": fmv_notes,
                 "locg_id": locg_id, "locg_variant_id": locg_variant_id,
             })
-        _server_request("post", "/api/bids", json=payload)
+        resp = _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
         click.echo(f"Added snipe for {item_id} with max bid {bid}")
+        if isinstance(resp, dict) and resp.get("warning"):
+            click.echo(click.style(f"⚠ {resp['warning']}", fg="yellow"), err=True)
         return
 
     # Existing direct-Gixen path
