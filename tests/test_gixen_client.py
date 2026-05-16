@@ -465,6 +465,46 @@ class TestAddSnipe:
             "doesn't stack throttle on top of login latency"
         )
 
+    def test_post_home_throttle_after_500_retry(self):
+        """When Gixen returns 500 and the recursive re-login path fires, the
+        login() call clears _last_post_at so the retry POST does NOT double-
+        sleep on top of login latency."""
+        client = _client()
+        client.session_id = "old"
+        client._min_post_gap = 1.5
+
+        sleeps: list = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        # First POST returns 500, login succeeds, retry POST returns 200.
+        bad_resp = MagicMock()
+        bad_resp.status_code = 500
+        bad_resp.text = ""
+        bad_resp.raise_for_status = MagicMock()
+
+        good_resp = MagicMock()
+        good_resp.status_code = 200
+        good_resp.text = "<html>OK</html>"
+        good_resp.raise_for_status = MagicMock()
+
+        login_resp = MagicMock()
+        login_resp.text = LOGIN_REDIRECT_HTML
+
+        client.session.post = MagicMock(
+            side_effect=[bad_resp, login_resp, good_resp]
+        )
+
+        with patch("gixen_client.time.sleep", side_effect=fake_sleep), \
+             patch("gixen_client.time.monotonic", return_value=100.0):
+            client._post_home({"a": "1"})
+
+        # No throttle sleeps: the first POST was the first call (no prior
+        # _last_post_at), login() clears the throttle, retry POST sees a
+        # cleared clock so it doesn't sleep either.
+        assert sleeps == [], f"expected no throttle sleeps but got {sleeps}"
+
     def test_post_home_no_throttle_when_gap_exceeded(self):
         """If enough time has passed since last POST, no throttle sleep occurs."""
         client = _client()
@@ -1378,6 +1418,33 @@ def test_cli_add_posts_to_server(monkeypatch):
             mock_req.post.assert_called_once()
             call_url = mock_req.post.call_args[0][0]
             assert "/api/bids" in call_url
+
+
+def test_cli_add_surfaces_server_warning_to_stderr(monkeypatch):
+    """When the server returns a `warning` field, the CLI must surface it on
+    stderr with a yellow ⚠ prefix so thin-client users see NULL-FMV warnings."""
+    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    monkeypatch.setenv("GIXEN_USERNAME", "u")
+    monkeypatch.setenv("GIXEN_PASSWORD", "p")
+
+    runner = CliRunner(mix_stderr=False)
+    with runner.isolated_filesystem():
+        with patch("cli.requests") as mock_req:
+            mock_resp = MagicMock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {
+                "item_id": "123456789", "status": "PENDING", "max_bid": 50.0,
+                "warning": "no FMV at grade 9.4 for ASM #300",
+            }
+            mock_req.post.return_value = mock_resp
+            mock_req.get.return_value = mock_resp
+
+            result = runner.invoke(cli_app, ["add", "123456789", "50.00"])
+            assert result.exit_code == 0
+            assert "⚠" in result.stderr, (
+                f"expected warning sigil in stderr, got: {result.stderr!r}"
+            )
+            assert "no FMV at grade 9.4" in result.stderr
 
 
 def test_cli_add_with_fmv_flags(monkeypatch):

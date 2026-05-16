@@ -28,7 +28,7 @@ from server.db import (
     get_bid_by_item_id, update_bid, update_bid_status, delete_bid,
     get_all_bids, get_pending_bids, mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
-    get_fmvs_for_bid, get_primary_fmv_for_bid,
+    get_fmvs_for_bid, get_primary_fmv_for_bid, primary_comic_id_for_bid,
 )
 from server.title_parser import parse_title
 import ebay_bidder
@@ -927,6 +927,20 @@ async def api_add_bid(req: AddBidRequest):
     return result
 
 
+def _build_fmv_warning(item: dict) -> str | None:
+    """Dashboard / history warning when a classified bid (fmv_id set) has no
+    valuation on its fmv row (low IS NULL). Returns the warning string or
+    None. Shared between /api/snipes and /api/history."""
+    if item.get("fmv_id") is None:
+        return None
+    if item.get("fmv_low") is not None:
+        return None
+    return (
+        f"no FMV at grade {item.get('comic_grade')} for "
+        f"{item.get('comic_title') or '?'} #{item.get('comic_issue') or '?'}"
+    )
+
+
 def _build_add_warning(
     db: sqlite3.Connection, fmv_id: int, req: "AddBidRequest"
 ) -> str | None:
@@ -1044,12 +1058,11 @@ async def api_get_snipes():
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
         title = item.get("ebay_title") or item.get("comic_title") or ""
-        fmv_warning = None
-        if item.get("fmv_id") is not None and item.get("fmv_low") is None:
-            fmv_warning = (
-                f"no FMV at grade {item.get('comic_grade')} for "
-                f"{item.get('comic_title') or '?'} #{item.get('comic_issue') or '?'}"
-            )
+        try:
+            fmv_warning = _build_fmv_warning(item)
+        except Exception:
+            logger.exception("failed to compute fmv warning for snipes row")
+            fmv_warning = None
         result.append({
             "item_id": item["item_id"],
             "title": title,
@@ -1125,12 +1138,11 @@ async def api_get_history():
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
         title = item.get("ebay_title") or item.get("comic_title") or ""
-        fmv_warning = None
-        if item.get("fmv_id") is not None and item.get("fmv_low") is None:
-            fmv_warning = (
-                f"no FMV at grade {item.get('comic_grade')} for "
-                f"{item.get('comic_title') or '?'} #{item.get('comic_issue') or '?'}"
-            )
+        try:
+            fmv_warning = _build_fmv_warning(item)
+        except Exception:
+            logger.exception("failed to compute fmv warning for history row")
+            fmv_warning = None
         result.append({
             "item_id": item["item_id"],
             "title": title,
@@ -1240,13 +1252,10 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     # COALESCE preserves existing values when only one of the two is supplied.
     if req.locg_id is not None or req.locg_variant_id is not None:
         bid_row = get_bid_by_item_id(db, item_id)
-        target_comic_id: int | None = None
-        if bid_row is not None and bid_row["fmv_id"] is not None:
-            fmv_row = db.execute(
-                "SELECT comic_id FROM fmv WHERE id=?", (bid_row["fmv_id"],)
-            ).fetchone()
-            if fmv_row is not None:
-                target_comic_id = fmv_row["comic_id"]
+        target_comic_id = (
+            primary_comic_id_for_bid(db, bid_row["id"])
+            if bid_row is not None else None
+        )
         if target_comic_id is not None:
             db.execute(
                 """
@@ -1342,10 +1351,7 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest):
                     "to target a specific issue or run extract-comics first."
                 ),
             )
-        primary_fmv_row = db.execute(
-            "SELECT comic_id FROM fmv WHERE id=?", (bid_row["fmv_id"],)
-        ).fetchone()
-        target_comic_id = primary_fmv_row["comic_id"]
+        target_comic_id = primary_comic_id_for_bid(db, bid_row["id"])
 
     db.execute(
         """

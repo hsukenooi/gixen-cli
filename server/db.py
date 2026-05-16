@@ -736,6 +736,25 @@ def get_fmv_for_bid(
     ).fetchone()
 
 
+def primary_comic_id_for_bid(
+    conn: sqlite3.Connection, bid_id: int
+) -> int | None:
+    """Resolve the comic_id of the bid's primary fmv linkage. Returns None
+    when the bid has no fmv_id or the fmv row is gone (FK should prevent
+    the latter, but the helper is defensive). Replaces three inline
+    `SELECT comic_id FROM fmv WHERE id=?` lookups in server/main.py."""
+    row = conn.execute(
+        """
+        SELECT f.comic_id
+        FROM bids b
+        JOIN fmv  f ON f.id = b.fmv_id
+        WHERE b.id = ?
+        """,
+        (bid_id,),
+    ).fetchone()
+    return row["comic_id"] if row else None
+
+
 def link_fmv_to_bid(
     conn: sqlite3.Connection,
     bid_id: int,

@@ -355,6 +355,53 @@ def test_upsert_fmv_preserves_on_partial_update(db):
     assert row["notes"] == "first pass"
 
 
+def test_upsert_fmv_rejects_null_grade(db):
+    """grade is the UNIQUE component on fmv — accepting NULL would silently
+    create rows that bypass the (comic_id, grade) uniqueness assumption."""
+    cid = upsert_comic(db, "Hulk", "181", 1974)
+    with pytest.raises(ValueError, match="grade is required"):
+        upsert_fmv(db, comic_id=cid, grade=None,
+                   low=50.0, high=70.0, comps=None,
+                   confidence=None, notes=None)
+
+
+def test_migration_merges_fmv_from_non_survivor_when_survivor_null(tmp_path):
+    """Survivor (chosen via locg_id priority) has no fmv_low; loser at the
+    same grade carries fmv_low. After migration the fmv row at that grade
+    has the loser's valuation merged in with a [merged from legacy comic_id=]
+    notes prefix."""
+    path = tmp_path / "merge.db"
+    conn = _build_legacy_db_no_unique(path)
+    # Survivor: locg_id wins it, fmv_low NULL.
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, locg_id) "
+        "VALUES (10, 'ASM', '300', 1988, 9.0, 11111)"
+    )
+    # Loser: same grade, carries valuation.
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low, fmv_high, "
+        "fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at) "
+        "VALUES (20, 'ASM', '300', 1988, 9.0, 800, 1000, 12, 'high', "
+        "'loser research', '2026-05-01T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        # One survivor.
+        n = new.execute(
+            "SELECT COUNT(*) FROM comics WHERE title='ASM' AND issue='300'"
+        ).fetchone()[0]
+        assert n == 1
+        # fmv row carries loser's valuation.
+        fmv = new.execute("SELECT low, notes FROM fmv WHERE grade=9.0").fetchone()
+        assert fmv["low"] == 800
+        assert "merged from legacy comic_id=" in (fmv["notes"] or "")
+    finally:
+        new.close()
+
+
 def test_upsert_fmv_different_grades_coexist(db):
     cid = upsert_comic(db, "ASM", "300", 1988)
     f1 = upsert_fmv(db, cid, 9.2, 800.0, 1000.0, 12, "high", "")
