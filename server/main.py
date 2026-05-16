@@ -1473,9 +1473,21 @@ async def api_purge(req: PurgeRequest):
 async def api_extract_comics():
     """Parse cached eBay titles for unlinked bids and link them to comics.
 
-    Idempotent: skips bids that already have comic_id set, and reuses existing
-    comics rows via upsert_comic. Does NOT call eBay (works only from cached
-    ebay_title values). Skips bids without a confidently parseable issue/year.
+    Idempotent: bids with fmv_id NOT NULL are excluded by the filter. Reuses
+    existing comics rows via upsert_comic. Does NOT call eBay (works only
+    from cached ebay_title values).
+
+    Skip categories:
+      - `skipped`         — no series/issue extracted, or no year. The filter
+                            on `fmv_id IS NULL` keeps re-picking these on
+                            every call (acceptable: zero work happens).
+      - `skipped_no_grade` — series+issue+year parsed but no grade. Bids land
+                            here when the title omits a grade. We don't create
+                            an fmv link (would require choosing a sentinel
+                            grade), so the bid stays in `fmv_id IS NULL` and
+                            re-appears on subsequent calls. `linked` is NOT
+                            incremented for these — the count reflects only
+                            bids that actually got a fmv_id linkage.
     """
     db = _get_db()
 
@@ -1493,6 +1505,7 @@ async def api_extract_comics():
     processed = 0
     linked = 0
     skipped: list[dict] = []
+    skipped_no_grade: list[str] = []
     errors: list[dict] = []
 
     for row in rows:
@@ -1523,21 +1536,31 @@ async def api_extract_comics():
             skipped.append({"item_id": item_id, "reason": "no year extracted"})
             continue
 
+        # No grade: parser pulled enough to upsert a comic identity but no
+        # grade — without a grade we can't manufacture an fmv stub, so the
+        # bid stays unlinked (fmv_id NULL). Surface this in skipped_no_grade
+        # so the agent / CLI can distinguish "couldn't parse" from "parsed
+        # but caller needs to supply --grade explicitly via cli.py add".
+        if parsed.grade is None:
+            skipped_no_grade.append(item_id)
+            continue
+
         try:
             for idx, issue in enumerate(issues):
                 comic_id = upsert_comic(
                     db, title=parsed.series, issue=issue, year=parsed.year,
                 )
-                if parsed.grade is not None:
-                    # Manufacture an fmv stub at the parsed grade (NULL
-                    # valuation — parser doesn't supply FMV).
-                    fid = upsert_fmv(
-                        db, comic_id=comic_id, grade=parsed.grade,
-                        low=None, high=None, comps=None,
-                        confidence=None,
-                        notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
-                    )
-                    link_fmv_to_bid(db, row["id"], fid, is_primary=(idx == 0))
+                # Manufacture an fmv stub at the parsed grade (NULL valuation
+                # — parser doesn't supply FMV). The link_fmv_to_bid call sets
+                # bids.fmv_id for the primary issue, which removes this bid
+                # from `fmv_id IS NULL` for future extract-comics runs.
+                fid = upsert_fmv(
+                    db, comic_id=comic_id, grade=parsed.grade,
+                    low=None, high=None, comps=None,
+                    confidence=None,
+                    notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
+                )
+                link_fmv_to_bid(db, row["id"], fid, is_primary=(idx == 0))
             linked += 1
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
@@ -1546,5 +1569,6 @@ async def api_extract_comics():
         "processed": processed,
         "linked": linked,
         "skipped": skipped,
+        "skipped_no_grade": skipped_no_grade,
         "errors": errors,
     }

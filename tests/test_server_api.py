@@ -1227,6 +1227,35 @@ def test_post_comic_fmv_unknown_comic_returns_404(api):
     assert r.status_code == 404
 
 
+def test_extract_comics_reports_no_grade_skips_separately(api):
+    """A title with year/issue/series but no parseable grade is skipped
+    explicitly via `skipped_no_grade`. The work set shrinks (next call's
+    `processed` doesn't re-pick it up the same way) and `linked` is honest."""
+    api.mock_gixen.list_snipes.return_value = []
+    r = api.post("/api/bids", json={"item_id": "778000111", "max_bid": 50.0})
+    assert r.status_code == 200
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Daredevil #29 Marvel 1967", "778000111"),
+    )
+    db.commit()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    # Bid is reported in `skipped_no_grade` (a flat list of item_ids), not
+    # counted as `linked`.
+    assert "778000111" in body.get("skipped_no_grade", [])
+    assert body.get("linked", 0) == 0
+    # No fmv linkage was made (no grade -> no fmv stub).
+    bid = db.execute(
+        "SELECT fmv_id FROM bids WHERE item_id=?", ("778000111",)
+    ).fetchone()
+    assert bid[0] is None
+
+
 def test_extract_comics_writes_fmv_stub_with_grade(api):
     api.mock_gixen.list_snipes.return_value = []
     r = api.post("/api/bids", json={"item_id": "777000111", "max_bid": 50.0})

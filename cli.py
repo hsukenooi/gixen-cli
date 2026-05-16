@@ -513,10 +513,23 @@ def extract_comics_cmd():
     processed = result.get("processed", 0)
     linked = result.get("linked", 0)
     skipped = result.get("skipped", []) or []
+    skipped_no_grade = result.get("skipped_no_grade", []) or []
     errors = result.get("errors", []) or []
-    click.echo(f"Processed {processed}, linked {linked}, skipped {len(skipped)}, errors {len(errors)}.")
+    click.echo(
+        f"Processed {processed}, linked {linked}, "
+        f"skipped {len(skipped)}, no-grade {len(skipped_no_grade)}, "
+        f"errors {len(errors)}."
+    )
     for s in skipped:
         click.echo(f"  skip {s.get('item_id', '?')}: {s.get('reason', 'unknown')}")
+    if skipped_no_grade:
+        # Stderr so agents reading stdout for JSON-ish output don't have to
+        # parse this; emit a compact list so a small terminal stays readable.
+        click.echo(
+            f"  no-grade: {', '.join(skipped_no_grade)} "
+            f"— pass --grade via `cli.py add` to link these",
+            err=True,
+        )
     for e in errors:
         click.echo(f"  err  {e}", err=True)
 
