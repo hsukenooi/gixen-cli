@@ -416,3 +416,174 @@ def test_bid_fmvs_has_expected_columns(db):
 def test_bids_fmv_id_column_exists(db):
     cols = {row[1] for row in db.execute("PRAGMA table_info(bids)")}
     assert "fmv_id" in cols
+
+
+from server.db import (
+    upsert_fmv, set_bid_fmv, get_fmv_for_bid, link_fmv_to_bid,
+)
+
+
+def test_upsert_fmv_inserts_with_values(db):
+    cid = upsert_comic(db, title="Hulk", issue="181", year=1974,
+                       grade=None, fmv_low=None, fmv_high=None,
+                       fmv_comps=None, fmv_confidence=None, fmv_notes=None)
+    fid = upsert_fmv(db, comic_id=cid, grade=9.2,
+                     low=4000.0, high=5500.0, comps=12,
+                     confidence="high", notes="GPA Jan 2026")
+    assert isinstance(fid, int)
+    row = db.execute("SELECT * FROM fmv WHERE id=?", (fid,)).fetchone()
+    assert row["low"] == 4000.0
+    assert row["high"] == 5500.0
+    assert row["confidence"] == "high"
+    assert row["updated_at"] is not None
+
+
+def test_upsert_fmv_inserts_null_valuation(db):
+    """Grade-only row, no FMV researched yet. updated_at stays NULL because
+    no actual valuation was supplied."""
+    cid = upsert_comic(db, "ASM", "300", 1988, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.2, low=None, high=None, comps=None,
+                     confidence=None, notes=None)
+    row = db.execute("SELECT * FROM fmv WHERE id=?", (fid,)).fetchone()
+    assert row["grade"] == 9.2
+    assert row["low"] is None
+    assert row["high"] is None
+    assert row["updated_at"] is None
+
+
+def test_upsert_fmv_idempotent_on_conflict(db):
+    cid = upsert_comic(db, "X-Men", "1", 1963, None,
+                       None, None, None, None, None)
+    f1 = upsert_fmv(db, cid, 8.0, low=500.0, high=700.0, comps=5,
+                    confidence="medium", notes="")
+    f2 = upsert_fmv(db, cid, 8.0, low=550.0, high=750.0, comps=8,
+                    confidence="high", notes="Updated")
+    assert f1 == f2
+    row = db.execute("SELECT low, confidence FROM fmv WHERE id=?", (f1,)).fetchone()
+    assert row["low"] == 550.0
+    assert row["confidence"] == "high"
+
+
+def test_upsert_fmv_preserves_on_partial_update(db):
+    cid = upsert_comic(db, "Spawn", "1", 1992, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.8, 100.0, 150.0, 5, "high", "first pass")
+    upsert_fmv(db, cid, 9.8, low=120.0, high=None, comps=None,
+               confidence=None, notes=None)
+    row = db.execute("SELECT * FROM fmv WHERE id=?", (fid,)).fetchone()
+    assert row["low"] == 120.0
+    assert row["high"] == 150.0
+    assert row["comps"] == 5
+    assert row["confidence"] == "high"
+    assert row["notes"] == "first pass"
+
+
+def test_upsert_fmv_different_grades_coexist(db):
+    cid = upsert_comic(db, "ASM", "300", 1988, None,
+                       None, None, None, None, None)
+    f1 = upsert_fmv(db, cid, 9.2, 800.0, 1000.0, 12, "high", "")
+    f2 = upsert_fmv(db, cid, 7.0, 200.0, 300.0, 8, "high", "")
+    assert f1 != f2
+    rows = db.execute(
+        "SELECT grade, low FROM fmv WHERE comic_id=? ORDER BY grade",
+        (cid,),
+    ).fetchall()
+    assert [(r["grade"], r["low"]) for r in rows] == [(7.0, 200.0), (9.2, 800.0)]
+
+
+def test_set_bid_fmv_sets_value(db):
+    cid = upsert_comic(db, "Hulk", "181", 1974, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.0, 50.0, 70.0, 8, "high", "")
+    bid_id = insert_bid(db, "111111", 50.0, None, 6, 0, "s")
+    set_bid_fmv(db, bid_id, fid)
+    row = db.execute("SELECT fmv_id FROM bids WHERE id=?", (bid_id,)).fetchone()
+    assert row["fmv_id"] == fid
+
+
+def test_set_bid_fmv_accepts_none(db):
+    cid = upsert_comic(db, "Hulk", "181", 1974, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.0, 50.0, 70.0, 8, "high", "")
+    bid_id = insert_bid(db, "111112", 50.0, None, 6, 0, "s")
+    set_bid_fmv(db, bid_id, fid)
+    set_bid_fmv(db, bid_id, None)
+    row = db.execute("SELECT fmv_id FROM bids WHERE id=?", (bid_id,)).fetchone()
+    assert row["fmv_id"] is None
+
+
+def test_get_fmv_for_bid_returns_joined_row(db):
+    cid = upsert_comic(db, "ASM", "300", 1988, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.2, 800.0, 1000.0, 12, "high", "")
+    bid_id = insert_bid(db, "111113", 600.0, None, 6, 0, "s")
+    set_bid_fmv(db, bid_id, fid)
+    fmv = get_fmv_for_bid(db, bid_id)
+    assert fmv is not None
+    assert fmv["low"] == 800.0
+    assert fmv["grade"] == 9.2
+    assert fmv["comic_id"] == cid
+
+
+def test_get_fmv_for_bid_returns_none_when_unlinked(db):
+    bid_id = insert_bid(db, "111114", 600.0, None, 6, 0, "s")
+    assert get_fmv_for_bid(db, bid_id) is None
+
+
+def test_link_fmv_to_bid_basic(db):
+    cid = upsert_comic(db, "ASM", "300", 1988, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.2, None, None, None, None, None)
+    bid_id = insert_bid(db, "111115", 600.0, None, 6, 0, "s")
+    link_fmv_to_bid(db, bid_id, fid)
+    rows = db.execute("SELECT * FROM bid_fmvs WHERE bid_id=?", (bid_id,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["fmv_id"] == fid
+    assert rows[0]["is_primary"] == 0
+
+
+def test_link_fmv_to_bid_primary_mirrors_to_bids_fmv_id(db):
+    cid = upsert_comic(db, "ASM", "300", 1988, None,
+                       None, None, None, None, None)
+    fid = upsert_fmv(db, cid, 9.2, None, None, None, None, None)
+    bid_id = insert_bid(db, "111116", 600.0, None, 6, 0, "s")
+    link_fmv_to_bid(db, bid_id, fid, is_primary=True)
+    row = db.execute("SELECT fmv_id FROM bids WHERE id=?", (bid_id,)).fetchone()
+    assert row["fmv_id"] == fid
+
+
+def test_link_fmv_to_bid_primary_demotes_prior(db):
+    cid = upsert_comic(db, "Daredevil", "1", 1993, None,
+                       None, None, None, None, None)
+    f1 = upsert_fmv(db, cid, 9.0, None, None, None, None, None)
+    f2 = upsert_fmv(db, cid, 7.0, None, None, None, None, None)
+    bid_id = insert_bid(db, "111117", 100.0, None, 6, 0, "s")
+    link_fmv_to_bid(db, bid_id, f1, is_primary=True)
+    link_fmv_to_bid(db, bid_id, f2, is_primary=True)
+    by_fmv = {
+        r["fmv_id"]: r["is_primary"] for r in db.execute(
+            "SELECT fmv_id, is_primary FROM bid_fmvs WHERE bid_id=?", (bid_id,)
+        )
+    }
+    assert by_fmv[f1] == 0
+    assert by_fmv[f2] == 1
+
+
+def test_fk_invariant_fmv_id_must_exist(db):
+    """Trying to set bids.fmv_id to a non-existent fmv.id fails the FK."""
+    bid_id = insert_bid(db, "111118", 100.0, None, 6, 0, "s")
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("UPDATE bids SET fmv_id=999999 WHERE id=?", (bid_id,))
+        db.commit()
+
+
+def test_fk_invariant_bid_fmvs_fmv_id_must_exist(db):
+    """Junction can't point at a non-existent fmv either."""
+    bid_id = insert_bid(db, "111119", 100.0, None, 6, 0, "s")
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, 999999, 0)",
+            (bid_id,),
+        )
+        db.commit()

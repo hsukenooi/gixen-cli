@@ -182,6 +182,108 @@ def upsert_comic(
     return row["id"]
 
 
+def upsert_fmv(
+    conn: sqlite3.Connection,
+    comic_id: int,
+    grade: float,
+    low: float | None,
+    high: float | None,
+    comps: int | None,
+    confidence: str | None,
+    notes: str | None,
+) -> int:
+    """Upsert per-grade FMV row. Returns the fmv.id.
+
+    COALESCE on every value field preserves existing entries when partial
+    updates arrive. `updated_at` is bumped only when at least one valuation
+    field is non-NULL on this call — so a grade-only stub stays with
+    updated_at=NULL until real research lands."""
+    if grade is None:
+        raise ValueError("upsert_fmv: grade is required")
+    now = datetime.now(timezone.utc).isoformat()
+    any_val = any(v is not None for v in (low, high, comps, confidence, notes))
+    conn.execute(
+        """
+        INSERT INTO fmv (comic_id, grade, low, high, comps, confidence,
+                         notes, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(comic_id, grade) DO UPDATE SET
+            low        = COALESCE(excluded.low,        low),
+            high       = COALESCE(excluded.high,       high),
+            comps      = COALESCE(excluded.comps,      comps),
+            confidence = COALESCE(excluded.confidence, confidence),
+            notes      = COALESCE(excluded.notes,      notes),
+            updated_at = CASE WHEN ? THEN excluded.updated_at ELSE updated_at END
+        """,
+        (comic_id, grade, low, high, comps, confidence, notes,
+         now if any_val else None,
+         1 if any_val else 0),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM fmv WHERE comic_id=? AND grade=?",
+        (comic_id, grade),
+    ).fetchone()
+    return row["id"]
+
+
+def set_bid_fmv(
+    conn: sqlite3.Connection,
+    bid_id: int,
+    fmv_id: int | None,
+) -> None:
+    """Set bids.fmv_id. None clears the linkage (e.g. unclassified bid)."""
+    conn.execute("UPDATE bids SET fmv_id = ? WHERE id = ?", (fmv_id, bid_id))
+    conn.commit()
+
+
+def get_fmv_for_bid(
+    conn: sqlite3.Connection,
+    bid_id: int,
+) -> sqlite3.Row | None:
+    """Return the fmv row this bid points at via fmv_id, or None if unlinked.
+    Includes comic_id so callers can read it without a second query."""
+    return conn.execute(
+        """
+        SELECT f.*
+        FROM bids b
+        JOIN fmv  f ON f.id = b.fmv_id
+        WHERE b.id = ?
+        """,
+        (bid_id,),
+    ).fetchone()
+
+
+def link_fmv_to_bid(
+    conn: sqlite3.Connection,
+    bid_id: int,
+    fmv_id: int,
+    is_primary: bool = False,
+) -> None:
+    """Insert into bid_fmvs. If is_primary, demote prior primary entries for
+    this bid and mirror to bids.fmv_id. Idempotent."""
+    if is_primary:
+        conn.execute(
+            "UPDATE bid_fmvs SET is_primary=0 WHERE bid_id=? AND fmv_id != ?",
+            (bid_id, fmv_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary)
+            VALUES (?, ?, 1)
+            ON CONFLICT(bid_id, fmv_id) DO UPDATE SET is_primary = 1
+            """,
+            (bid_id, fmv_id),
+        )
+        conn.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fmv_id, bid_id))
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, 0)",
+            (bid_id, fmv_id),
+        )
+    conn.commit()
+
+
 def insert_bid(
     conn: sqlite3.Connection,
     item_id: str,
