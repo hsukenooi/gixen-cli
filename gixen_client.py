@@ -129,6 +129,17 @@ class GixenParseError(GixenError):
     """HTML response didn't match expected structure."""
 
 
+class GixenAddNotConfirmedError(GixenError):
+    """add_snipe POST returned no error but the item never appeared in the list."""
+
+    def __init__(self, item_id: str):
+        self.item_id = str(item_id)
+        super().__init__(
+            f"Gixen accepted add for item {item_id} but it never appeared in the "
+            f"snipe list — likely silently rate-limited or dropped."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -138,6 +149,11 @@ _LOGIN_COOLDOWN = 300  # seconds to wait after a failed login before retrying
 
 class GixenClient:
     """Web-scraping client for Gixen.com."""
+
+    # Minimum seconds between Gixen write POSTs — prevents silent drops during bursts.
+    _min_post_gap: float = 1.5
+    # Backoff before retrying an add_snipe that wasn't confirmed by list_snipes.
+    _add_retry_backoff: float = 5.0
 
     def __init__(
         self,
@@ -151,6 +167,7 @@ class GixenClient:
         self.session = _CurlSession()
         self.session_id: Optional[str] = None
         self._login_failed_at: Optional[float] = None  # monotonic timestamp
+        self._last_post_at: Optional[float] = None  # monotonic timestamp of last _post_home
 
     # ------------------------------------------------------------------
     # Authentication
@@ -245,9 +262,16 @@ class GixenClient:
 
     def _post_home(self, data: dict, retry_on_expired: bool = True, check_errors: bool = True) -> str:
         """POST to the home page. Auto-re-login on session expiration."""
+        if self._min_post_gap and self._last_post_at is not None:
+            elapsed = time.monotonic() - self._last_post_at
+            remaining = self._min_post_gap - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
         resp = self.session.post(
             self._home_url(), data=data, timeout=self.timeout
         )
+        self._last_post_at = time.monotonic()
 
         # Gixen returns HTTP 500 for requests with a stale/invalid session.
         # Treat it as session expiry and retry after re-login.
@@ -325,6 +349,9 @@ class GixenClient:
 
         Raises:
             GixenItemError: If the item can't be added (not found, duplicate, etc.)
+            GixenAddNotConfirmedError: If the POST returned no error but the snipe
+                never appeared in the snipe list (Gixen silently dropped it),
+                even after one retry.
         """
         data = {
             "newitemid": str(item_id),
@@ -334,9 +361,28 @@ class GixenClient:
             "newsnipegroup": str(snipe_group),
             "username": self.username,
         }
+        target = str(item_id)
+
         self._post_home(data)
-        logger.info("Added snipe: item=%s, max_bid=%s", item_id, max_bid)
-        return True
+        if any(s["item_id"] == target for s in self.list_snipes()):
+            logger.info("Added snipe: item=%s, max_bid=%s", item_id, max_bid)
+            return True
+
+        # Silent drop: Gixen returned 200 with no error banner, but the snipe
+        # never landed. Back off and retry once before giving up.
+        logger.warning(
+            "add_snipe for item=%s not confirmed in list; retrying after %.1fs",
+            item_id, self._add_retry_backoff,
+        )
+        if self._add_retry_backoff:
+            time.sleep(self._add_retry_backoff)
+
+        self._post_home(data)
+        if any(s["item_id"] == target for s in self.list_snipes()):
+            logger.info("Added snipe on retry: item=%s, max_bid=%s", item_id, max_bid)
+            return True
+
+        raise GixenAddNotConfirmedError(item_id)
 
     def modify_snipe(
         self,

@@ -18,6 +18,7 @@ from gixen_client import (
     GixenItemError,
     GixenSnipeNotFoundError,
     GixenParseError,
+    GixenAddNotConfirmedError,
     find_sibling_cleanup_targets,
 )
 
@@ -220,8 +221,10 @@ class TestAddSnipe:
     def test_add_success(self):
         client = _client()
         client.session_id = "99887766"
+        client._min_post_gap = 0  # disable throttle for test speed
 
-        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes", return_value=[{"item_id": "444555666", "dbidid": "5001"}]):
             result = client.add_snipe("444555666", Decimal("15.00"))
 
         assert result is True
@@ -235,8 +238,10 @@ class TestAddSnipe:
     def test_add_with_options(self):
         client = _client()
         client.session_id = "99887766"
+        client._min_post_gap = 0
 
-        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes", return_value=[{"item_id": "444", "dbidid": "5001"}]):
             client.add_snipe("444", Decimal("5"), bid_offset=3, snipe_group=2)
 
         data = mock_post.call_args[0][0]
@@ -246,6 +251,7 @@ class TestAddSnipe:
     def test_add_item_not_found(self):
         client = _client()
         client.session_id = "99887766"
+        client._min_post_gap = 0
 
         with patch.object(client, "_post_home", side_effect=GixenItemError(299, "The specified item Id was not found.")):
             with pytest.raises(GixenItemError) as exc_info:
@@ -255,11 +261,108 @@ class TestAddSnipe:
     def test_add_duplicate(self):
         client = _client()
         client.session_id = "99887766"
+        client._min_post_gap = 0
 
         with patch.object(client, "_post_home", side_effect=GixenItemError(202, "ITEM ALREADY PRESENT")):
             with pytest.raises(GixenItemError) as exc_info:
                 client.add_snipe("111", Decimal("5"))
             assert exc_info.value.code == 202
+
+    def test_add_silent_failure_retries_then_succeeds(self):
+        """Gixen accepts the POST but drops the snipe. First verify fails,
+        retry POST + verify succeeds, no exception raised."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0  # skip sleep in test
+
+        # list_snipes: first verify (empty -> absent), second verify after retry (present)
+        list_calls = [[], [{"item_id": "777", "dbidid": "5099"}]]
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes", side_effect=list_calls):
+            result = client.add_snipe("777", Decimal("10.00"))
+
+        assert result is True
+        # Two POSTs: original + retry
+        assert mock_post.call_count == 2
+
+    def test_add_silent_failure_persists_raises(self):
+        """Snipe absent after both initial and retry verify -> raises GixenAddNotConfirmedError."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes", return_value=[]):
+            with pytest.raises(GixenAddNotConfirmedError) as exc_info:
+                client.add_snipe("888", Decimal("12.00"))
+
+        assert "888" in str(exc_info.value)
+        # Initial POST + one retry POST
+        assert mock_post.call_count == 2
+
+    def test_add_not_confirmed_error_is_gixen_error(self):
+        assert issubclass(GixenAddNotConfirmedError, GixenError)
+
+    def test_post_home_throttles_consecutive_posts(self):
+        """Two _post_home calls in quick succession sleep to enforce minimum gap."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 1.5
+
+        sleep_calls: list = []
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        # monotonic returns: first call captures last_post_at after POST 1,
+        # second call computes elapsed at start of POST 2, then captures last_post_at.
+        monotonic_values = iter([0.0, 0.1, 0.1])
+
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = "<html>OK</html>"
+        ok_resp.raise_for_status = MagicMock()
+        client.session.post = MagicMock(return_value=ok_resp)
+
+        with patch("gixen_client.time.sleep", side_effect=fake_sleep), \
+             patch("gixen_client.time.monotonic", side_effect=lambda: next(monotonic_values)):
+            client._post_home({"a": "1"})
+            client._post_home({"b": "2"})
+
+        # Elapsed = 0.1 - 0.0 = 0.1, remaining = 1.5 - 0.1 = 1.4
+        assert sleep_calls, "Expected at least one throttle sleep"
+        assert any(s >= 1.0 for s in sleep_calls), (
+            f"Expected a throttle sleep >= 1.0s but got {sleep_calls}"
+        )
+
+    def test_post_home_no_throttle_when_gap_exceeded(self):
+        """If enough time has passed since last POST, no throttle sleep occurs."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 1.5
+
+        sleep_calls: list = []
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        monotonic_values = iter([0.0, 10.0, 10.0])
+
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = "<html>OK</html>"
+        ok_resp.raise_for_status = MagicMock()
+        client.session.post = MagicMock(return_value=ok_resp)
+
+        with patch("gixen_client.time.sleep", side_effect=fake_sleep), \
+             patch("gixen_client.time.monotonic", side_effect=lambda: next(monotonic_values)):
+            client._post_home({"a": "1"})
+            client._post_home({"b": "2"})
+
+        assert sleep_calls == [], f"Expected no sleeps but got {sleep_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +570,7 @@ class TestExceptionHierarchy:
         assert issubclass(GixenItemError, GixenError)
         assert issubclass(GixenSnipeNotFoundError, GixenError)
         assert issubclass(GixenParseError, GixenError)
+        assert issubclass(GixenAddNotConfirmedError, GixenError)
 
     def test_item_error_has_code(self):
         err = GixenItemError(299, "Not found")
