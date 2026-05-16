@@ -434,40 +434,26 @@ def upsert_comic(
     title: str,
     issue: str,
     year: int,
-    grade: float | None,
-    fmv_low: float | None,
-    fmv_high: float | None,
-    fmv_comps: int | None,
-    fmv_confidence: str | None,
-    fmv_notes: str | None,
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
 ) -> int:
-    now = datetime.now(timezone.utc).isoformat()
+    """Upsert a comic identity row keyed by (title, issue, year). Returns id.
+
+    Per-grade FMV lives in the `fmv` table — call `upsert_fmv(conn, id, grade, ...)`."""
     conn.execute(
         """
-        INSERT INTO comics (title, issue, year, grade, fmv_low, fmv_high,
-                            fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at,
-                            locg_id, locg_variant_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(title, issue, year, grade) DO UPDATE SET
-            fmv_low         = COALESCE(excluded.fmv_low,        fmv_low),
-            fmv_high        = COALESCE(excluded.fmv_high,       fmv_high),
-            fmv_comps       = COALESCE(excluded.fmv_comps,      fmv_comps),
-            fmv_confidence  = COALESCE(excluded.fmv_confidence, fmv_confidence),
-            fmv_notes       = COALESCE(excluded.fmv_notes,      fmv_notes),
-            fmv_updated_at  = CASE WHEN excluded.fmv_low IS NOT NULL THEN excluded.fmv_updated_at ELSE fmv_updated_at END,
+        INSERT INTO comics (title, issue, year, locg_id, locg_variant_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(title, issue, year) DO UPDATE SET
             locg_id         = COALESCE(excluded.locg_id,         locg_id),
             locg_variant_id = COALESCE(excluded.locg_variant_id, locg_variant_id)
         """,
-        (title, issue, year, grade, fmv_low, fmv_high,
-         fmv_comps, fmv_confidence, fmv_notes, now,
-         locg_id, locg_variant_id),
+        (title, issue, year, locg_id, locg_variant_id),
     )
     conn.commit()
     row = conn.execute(
-        "SELECT id FROM comics WHERE title=? AND issue=? AND year=? AND grade IS ?",
-        (title, issue, year, grade),
+        "SELECT id FROM comics WHERE title=? AND issue=? AND year=?",
+        (title, issue, year),
     ).fetchone()
     return row["id"]
 
@@ -578,17 +564,17 @@ def insert_bid(
     conn: sqlite3.Connection,
     item_id: str,
     max_bid: float,
-    comic_id: int | None,
+    fmv_id: int | None,
     bid_offset: int,
     snipe_group: int,
     seller: str | None,
 ) -> int:
     cur = conn.execute(
         """
-        INSERT INTO bids (item_id, max_bid, comic_id, bid_offset, snipe_group, seller)
+        INSERT INTO bids (item_id, max_bid, fmv_id, bid_offset, snipe_group, seller)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (item_id, max_bid, comic_id, bid_offset, snipe_group, seller),
+        (item_id, max_bid, fmv_id, bid_offset, snipe_group, seller),
     )
     conn.commit()
     return cur.lastrowid
@@ -601,47 +587,20 @@ def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | 
     ).fetchone()
 
 
-def link_comic_to_bid(
-    conn: sqlite3.Connection,
-    bid_id: int,
-    comic_id: int,
-    is_primary: bool = False,
-) -> None:
-    """Add a comic to a bid's set. If is_primary, demote any prior primary,
-    promote this one, and mirror to bids.comic_id (backward-compat pointer).
-    Idempotent: re-running with the same args is a no-op aside from primary
-    bookkeeping."""
-    if is_primary:
-        conn.execute(
-            "UPDATE bid_comics SET is_primary=0 WHERE bid_id=? AND comic_id != ?",
-            (bid_id, comic_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO bid_comics (bid_id, comic_id, is_primary)
-            VALUES (?, ?, 1)
-            ON CONFLICT(bid_id, comic_id) DO UPDATE SET is_primary = 1
-            """,
-            (bid_id, comic_id),
-        )
-        conn.execute("UPDATE bids SET comic_id=? WHERE id=?", (comic_id, bid_id))
-    else:
-        conn.execute(
-            "INSERT OR IGNORE INTO bid_comics (bid_id, comic_id, is_primary) VALUES (?, ?, 0)",
-            (bid_id, comic_id),
-        )
-    conn.commit()
-
-
-def get_comics_for_bid(conn: sqlite3.Connection, bid_id: int) -> list[sqlite3.Row]:
-    """All comics linked to a bid, primary first, then by numeric issue order."""
+def get_fmvs_for_bid(conn: sqlite3.Connection, bid_id: int) -> list[sqlite3.Row]:
+    """All fmv rows linked to a bid via bid_fmvs, JOINed with comic identity.
+    Primary first, then by numeric issue order."""
     return conn.execute(
         """
-        SELECT c.*, bc.is_primary
-        FROM bid_comics bc
-        JOIN comics c ON c.id = bc.comic_id
-        WHERE bc.bid_id = ?
-        ORDER BY bc.is_primary DESC,
+        SELECT f.id AS fmv_id, f.comic_id, f.grade,
+               f.low, f.high, f.comps, f.confidence, f.notes, f.updated_at,
+               c.title, c.issue, c.year, c.locg_id, c.locg_variant_id,
+               bf.is_primary
+        FROM bid_fmvs bf
+        JOIN fmv    f ON f.id = bf.fmv_id
+        JOIN comics c ON c.id = f.comic_id
+        WHERE bf.bid_id = ?
+        ORDER BY bf.is_primary DESC,
                  CAST(c.issue AS INTEGER),
                  c.issue
         """,
@@ -649,13 +608,16 @@ def get_comics_for_bid(conn: sqlite3.Connection, bid_id: int) -> list[sqlite3.Ro
     ).fetchall()
 
 
-def get_primary_comic_for_bid(conn: sqlite3.Connection, bid_id: int) -> sqlite3.Row | None:
+def get_primary_fmv_for_bid(conn: sqlite3.Connection, bid_id: int) -> sqlite3.Row | None:
     return conn.execute(
         """
-        SELECT c.*
-        FROM bid_comics bc
-        JOIN comics c ON c.id = bc.comic_id
-        WHERE bc.bid_id = ? AND bc.is_primary = 1
+        SELECT f.id AS fmv_id, f.comic_id, f.grade,
+               f.low, f.high, f.comps, f.confidence, f.notes,
+               c.title, c.issue, c.year
+        FROM bid_fmvs bf
+        JOIN fmv    f ON f.id = bf.fmv_id
+        JOIN comics c ON c.id = f.comic_id
+        WHERE bf.bid_id = ? AND bf.is_primary = 1
         LIMIT 1
         """,
         (bid_id,),
@@ -746,24 +708,46 @@ def list_comics(
     year: int | None = None,
     grade: float | None = None,
 ) -> list[sqlite3.Row]:
+    """List comic identity rows. If `grade` is supplied, JOIN fmv and return
+    valuation columns inline (renamed to the legacy `fmv_*` keys for response
+    compatibility). Without `grade`, returns identity rows only."""
     clauses, params = [], []
     if title is not None:
-        clauses.append("LOWER(title) = LOWER(?)")
+        clauses.append("LOWER(c.title) = LOWER(?)")
         params.append(title)
     if issue is not None:
-        clauses.append("issue = ?")
+        clauses.append("c.issue = ?")
         params.append(issue)
     if year is not None:
-        clauses.append("year = ?")
+        clauses.append("c.year = ?")
         params.append(year)
+
     if grade is not None:
-        clauses.append("grade = ?")
+        clauses.append("f.grade = ?")
         params.append(grade)
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    return conn.execute(
-        f"SELECT * FROM comics {where} ORDER BY id",
-        params,
-    ).fetchall()
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"""
+            SELECT c.*,
+                   f.grade,
+                   f.low  AS fmv_low,
+                   f.high AS fmv_high,
+                   f.comps AS fmv_comps,
+                   f.confidence AS fmv_confidence,
+                   f.notes AS fmv_notes,
+                   f.updated_at AS fmv_updated_at
+            FROM comics c
+            JOIN fmv f ON f.comic_id = c.id
+            {where}
+            ORDER BY c.id
+        """
+    else:
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"""
+            SELECT c.* FROM comics c
+            {where}
+            ORDER BY c.id
+        """
+    return conn.execute(sql, params).fetchall()
 
 
 def get_all_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
