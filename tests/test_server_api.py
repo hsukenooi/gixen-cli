@@ -1188,3 +1188,41 @@ def test_locg_link_variant_id_preserves_when_omitted(api):
     body = r.json()
     assert body["locg_id"] == 1111
     assert body["locg_variant_id"] == 9999
+
+
+def test_e2e_distinct_fmv_per_grade_on_same_comic(api):
+    api.mock_gixen.list_snipes.return_value = []
+    r1 = api.post("/api/comics", json={
+        "title": "ASM", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0,
+        "fmv_comps": 12, "fmv_confidence": "high",
+    })
+    r2 = api.post("/api/comics", json={
+        "title": "ASM", "issue": "300", "year": 1988,
+        "grade": 7.0, "fmv_low": 200.0, "fmv_high": 300.0,
+        "fmv_comps": 8, "fmv_confidence": "high",
+    })
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["id"] == r2.json()["id"]   # one identity
+
+    api.post("/api/bids", json={
+        "item_id": "555000001", "max_bid": 1500.0,
+        "comic": "ASM", "issue": "300", "year": 1988, "grade": 9.2,
+    })
+    api.post("/api/bids", json={
+        "item_id": "555000002", "max_bid": 400.0,
+        "comic": "ASM", "issue": "300", "year": 1988, "grade": 7.0,
+    })
+
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    n = db.execute(
+        "SELECT COUNT(*) FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()[0]
+    assert n == 1
+
+    snipes = api.get("/api/snipes").json()
+    by_item = {s["item_id"]: s for s in snipes}
+    assert by_item["555000001"]["fmv_low"] == 800.0
+    assert by_item["555000002"]["fmv_low"] == 200.0
+    assert by_item["555000001"]["fmv_id"] != by_item["555000002"]["fmv_id"]
