@@ -751,6 +751,69 @@ def test_migration_lot_with_grade_creates_one_bid_fmvs_per_comic(tmp_path):
         new.close()
 
 
+def test_migration_recovers_2026_05_13_incident(tmp_path):
+    """14 bids spread across 4 shadow comics rows after grade revisions.
+    Post-migration: one comics identity, 4 fmv rows, all 14 bids point at the
+    fmv row matching their original grade, and the original FMV at 9.0 is intact."""
+    path = tmp_path / "incident.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low, fmv_high, "
+        "fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at, locg_id) "
+        "VALUES (1, 'Spider-Man', '300', 1988, 9.0, 800, 1000, 12, 'high', "
+        "'GPA Jan 2026', '2026-05-01T00:00:00', 99999)"
+    )
+    for shadow_id, grade in [(2, 9.2), (3, 8.0), (4, 9.4)]:
+        conn.execute(
+            "INSERT INTO comics (id, title, issue, year, grade) VALUES (?, 'Spider-Man', '300', 1988, ?)",
+            (shadow_id, grade),
+        )
+    for i, comic_id in enumerate([1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4]):
+        conn.execute(
+            "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (?, ?, ?, 600)",
+            (100 + i, f"99{i:07d}", comic_id),
+        )
+        conn.execute(
+            "INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (?, ?, 1)",
+            (100 + i, comic_id),
+        )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        survivor = new.execute(
+            "SELECT id FROM comics WHERE title='Spider-Man' AND issue='300' AND year=1988"
+        ).fetchone()
+        assert survivor is not None
+
+        fmvs = {r["grade"]: r["low"] for r in new.execute(
+            "SELECT grade, low FROM fmv WHERE comic_id=?", (survivor["id"],)
+        )}
+        assert fmvs == {9.0: 800, 9.2: None, 8.0: None, 9.4: None}
+
+        fmv_id_by_grade = {r["grade"]: r["id"] for r in new.execute(
+            "SELECT id, grade FROM fmv WHERE comic_id=?", (survivor["id"],)
+        )}
+        all_bids = new.execute("SELECT item_id, fmv_id FROM bids").fetchall()
+        assert all(b["fmv_id"] is not None for b in all_bids)
+        item_to_grade = {f"99{i:07d}": g for i, g in enumerate(
+            [9.0, 9.0, 9.0, 9.0, 9.2, 9.2, 9.2, 8.0, 8.0, 8.0, 9.4, 9.4, 9.4, 9.4]
+        )}
+        for b in all_bids:
+            expected_fmv = fmv_id_by_grade[item_to_grade[b["item_id"]]]
+            assert b["fmv_id"] == expected_fmv
+
+        bid_at_9 = next(b for b in all_bids if item_to_grade[b["item_id"]] == 9.0)
+        bid_id = new.execute(
+            "SELECT id FROM bids WHERE item_id=?", (bid_at_9["item_id"],)
+        ).fetchone()["id"]
+        recovered = get_fmv_for_bid(new, bid_id)
+        assert recovered["low"] == 800
+    finally:
+        new.close()
+
+
 def test_migration_post_state_drops_legacy_columns(tmp_path):
     """After migration: comics.grade, comics.fmv_*, bids.comic_id are gone."""
     path = tmp_path / "post.db"
