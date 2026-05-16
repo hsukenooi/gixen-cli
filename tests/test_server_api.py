@@ -992,9 +992,10 @@ def test_sync_gixen_scheduled_stays_pending(api):
 # bid_comics junction: comics array + locg-link endpoint
 # ---------------------------------------------------------------------------
 
-def _seed_lot(api, item_id, title="Daredevil 1,2,3,4,5 Marvel 1993", max_bid=20.5):
+def _seed_lot(api, item_id, title="Daredevil 1,2,3,4,5 Marvel 1993 NM 9.4", max_bid=20.5):
     """Insert a bid + ebay_title, run extract-comics so the lot creates 5 comic
-    rows + 5 junction entries. Returns the bid_id."""
+    rows + 5 fmv rows + 5 junction entries. Title includes a grade so the parser
+    materializes the fmv link per Caveat #2 (explicit-opt-in)."""
     r = api.post("/api/bids", json={"item_id": item_id, "max_bid": max_bid})
     assert r.status_code == 200
     import os, sqlite3
@@ -1066,15 +1067,18 @@ def test_locg_link_specific_issue(api):
 
 def test_locg_link_auto_creates_missing_issue(api):
     """If --issue refers to an issue not yet in the bid's junction (e.g. the
-    parser missed it), the endpoint upserts a comic row + junction link."""
-    # Seed with a single-issue bid (no lot expansion)
+    parser missed it), the endpoint upserts a comic row + fmv stub at the
+    primary's grade + junction link. The title must include a grade so the
+    primary fmv linkage exists post-extract-comics (Caveat #2)."""
+    # Seed with a single-issue bid (no lot expansion) — title includes a grade
+    # so extract-comics materializes the fmv row + bid_fmvs junction.
     r = api.post("/api/bids", json={"item_id": "555000004", "max_bid": 10.0})
     assert r.status_code == 200
     import os, sqlite3
     db = sqlite3.connect(os.environ["DB_PATH"])
     db.execute(
         "UPDATE bids SET ebay_title=? WHERE item_id=?",
-        ("Daredevil The Man Without Fear #1 Marvel 1993", "555000004"),
+        ("Daredevil The Man Without Fear #1 Marvel 1993 NM 9.4", "555000004"),
     )
     db.commit()
     db.close()
@@ -1116,6 +1120,32 @@ def test_locg_link_no_primary_without_issue_409(api):
         json={"locg_id": 12345},
     )
     assert r.status_code == 409
+
+
+def test_extract_comics_writes_fmv_stub_with_grade(api):
+    api.mock_gixen.list_snipes.return_value = []
+    r = api.post("/api/bids", json={"item_id": "777000111", "max_bid": 50.0})
+    assert r.status_code == 200
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Amazing Spider-Man #300 1988 CGC 9.4", "777000111"),
+    )
+    db.commit()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    bid = db.execute(
+        "SELECT fmv_id FROM bids WHERE item_id=?", ("777000111",)
+    ).fetchone()
+    assert bid["fmv_id"] is not None
+    fmv = db.execute(
+        "SELECT grade, low FROM fmv WHERE id=?", (bid["fmv_id"],)
+    ).fetchone()
+    assert fmv["grade"] == 9.4
+    assert fmv["low"] is None  # parser doesn't supply FMV
 
 
 def test_locg_link_variant_id_preserves_when_omitted(api):
