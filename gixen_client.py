@@ -154,6 +154,13 @@ class GixenClient:
     _min_post_gap: float = 1.5
     # Backoff before retrying an add_snipe that wasn't confirmed by list_snipes.
     _add_retry_backoff: float = 5.0
+    # Account-keyed monotonic timestamp of the last _post_home call. Class-
+    # level so two GixenClient instances sharing the same username (e.g.
+    # _api_client + _sync_client in the server) actually serialize against
+    # Gixen-side rate limits. Without this, the two clients each carry their
+    # own _last_post_at and the throttle is per-instance, defeating the
+    # bursts-protection intent.
+    _last_post_at_by_user: dict[str, float] = {}
 
     def __init__(
         self,
@@ -167,7 +174,17 @@ class GixenClient:
         self.session = _CurlSession()
         self.session_id: Optional[str] = None
         self._login_failed_at: Optional[float] = None  # monotonic timestamp
-        self._last_post_at: Optional[float] = None  # monotonic timestamp of last _post_home
+
+    @property
+    def _last_post_at(self) -> Optional[float]:
+        return type(self)._last_post_at_by_user.get(self.username)
+
+    @_last_post_at.setter
+    def _last_post_at(self, value: Optional[float]) -> None:
+        if value is None:
+            type(self)._last_post_at_by_user.pop(self.username, None)
+        else:
+            type(self)._last_post_at_by_user[self.username] = value
 
     # ------------------------------------------------------------------
     # Authentication
@@ -215,6 +232,11 @@ class GixenClient:
 
         self._login_failed_at = None
         self.session_id = match.group(1)
+        # Clear the post-throttle: re-login already takes seconds and has
+        # effectively spaced the requests. Without this, the recursion path
+        # in _post_home (500 → relogin → retry) stacks throttle on top of
+        # login latency.
+        self._last_post_at = None
         logger.info("Logged in to Gixen (session_id=%s...)", self.session_id[:8])
         return self.session_id
 

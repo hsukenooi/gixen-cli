@@ -95,6 +95,17 @@ def _wrap_table(*rows):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_throttle_state():
+    """The throttle's last-post timestamp is keyed by username on the class
+    (so multiple GixenClient instances sharing an account serialize against
+    Gixen's per-account rate limit). Tests share `testuser`, so this state
+    leaks between tests if not reset."""
+    GixenClient._last_post_at_by_user.clear()
+    yield
+    GixenClient._last_post_at_by_user.clear()
+
+
 def _client():
     return GixenClient(username="testuser", password="testpass")
 
@@ -394,6 +405,64 @@ class TestAddSnipe:
         assert sleep_calls, "Expected at least one throttle sleep"
         assert any(s >= 1.0 for s in sleep_calls), (
             f"Expected a throttle sleep >= 1.0s but got {sleep_calls}"
+        )
+
+    def test_post_home_throttle_shared_across_instances_for_same_user(self):
+        """Two GixenClient instances sharing a username (e.g. _api_client +
+        _sync_client) must serialize against Gixen's account rate limit, not
+        each maintain its own throttle clock."""
+        c1 = GixenClient(username="testuser", password="x")
+        c2 = GixenClient(username="testuser", password="x")
+        c1.session_id = "99887766"
+        c2.session_id = "99887766"
+        c1._min_post_gap = 1.5
+        c2._min_post_gap = 1.5
+
+        sleeps: list = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        # c1 posts at t=0; c2 posts at t=0.1 — should sleep for the gap.
+        monotonic_values = iter([0.0, 0.1, 0.1])
+
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = "<html>OK</html>"
+        ok_resp.raise_for_status = MagicMock()
+        c1.session.post = MagicMock(return_value=ok_resp)
+        c2.session.post = MagicMock(return_value=ok_resp)
+
+        with patch("gixen_client.time.sleep", side_effect=fake_sleep), \
+             patch("gixen_client.time.monotonic", side_effect=lambda: next(monotonic_values)):
+            c1._post_home({"a": "1"})
+            c2._post_home({"b": "2"})
+
+        assert sleeps, (
+            "expected c2's _post_home to throttle off c1's post; throttle "
+            "state must be account-level not instance-level"
+        )
+
+    def test_post_home_throttle_cleared_after_login(self):
+        """Login already takes seconds (HTTP round trip); the recursion path
+        in _post_home (500 → relogin → retry) should not double-sleep on top
+        of that. Verify the throttle clock is cleared by login()."""
+        client = _client()
+        client._min_post_gap = 1.5
+
+        # Seed a recent post timestamp so the next throttle check would fire.
+        with patch("gixen_client.time.monotonic", return_value=100.0):
+            client._last_post_at = 100.0
+
+        # Login resp returns valid session HTML.
+        login_resp = MagicMock()
+        login_resp.text = LOGIN_REDIRECT_HTML
+        client.session.post = MagicMock(return_value=login_resp)
+
+        client.login()
+        assert client._last_post_at is None, (
+            "login() must clear _last_post_at so a subsequent _post_home "
+            "doesn't stack throttle on top of login latency"
         )
 
     def test_post_home_no_throttle_when_gap_exceeded(self):
