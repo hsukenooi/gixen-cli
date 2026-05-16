@@ -1270,6 +1270,106 @@ def test_locg_link_variant_id_preserves_when_omitted(api):
     assert body["locg_variant_id"] == 9999
 
 
+def test_api_snipes_response_includes_both_comic_id_and_fmv_id(api):
+    """v2-comics.html keys off `r.comic_id`. The new schema swapped that for
+    `fmv_id`, breaking the frontend. Both fields must be present in the
+    response so neither consumer breaks."""
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/comics", json={
+        "title": "ASM", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0,
+    })
+    api.post("/api/bids", json={
+        "item_id": "666000001", "max_bid": 500.0,
+        "comic": "ASM", "issue": "300", "year": 1988, "grade": 9.2,
+    })
+    snipes = api.get("/api/snipes").json()
+    assert len(snipes) == 1
+    assert snipes[0]["comic_id"] is not None
+    assert snipes[0]["fmv_id"] is not None
+
+
+def test_api_bids_response_includes_comic_id(api):
+    """v2-bids.html renders an r.comic_id column. Both fmv_id (new) and
+    comic_id (legacy) must be in the response."""
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 50.0,
+    })
+    api.post("/api/bids", json={
+        "item_id": "666000002", "max_bid": 60.0,
+        "comic": "Hulk", "issue": "181", "year": 1974, "grade": 9.0,
+    })
+    rows = api.get("/api/bids").json()
+    target = [r for r in rows if r["item_id"] == "666000002"]
+    assert target, "expected the just-added bid in the response"
+    assert "comic_id" in target[0]
+    assert target[0]["comic_id"] is not None
+    assert "fmv_id" in target[0]
+
+
+def test_api_history_response_includes_comic_id(api):
+    """Mirror coverage on /api/history."""
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 50.0,
+    })
+    api.post("/api/bids", json={
+        "item_id": "666000003", "max_bid": 60.0,
+        "comic": "Hulk", "issue": "181", "year": 1974, "grade": 9.0,
+    })
+    # Backdate end so it lands in history (past 7 days).
+    import os, sqlite3
+    from datetime import datetime, timedelta, timezone
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    raw.execute("UPDATE bids SET auction_end_at=? WHERE item_id=?", (past, "666000003"))
+    raw.commit()
+    raw.close()
+    rows = api.get("/api/history").json()
+    target = [r for r in rows if r["item_id"] == "666000003"]
+    assert target
+    assert target[0]["comic_id"] is not None
+
+
+def test_api_post_comics_response_includes_fmv_fields_when_grade_provided(api):
+    """Pre-FMV-split, POST /api/comics returned grade/fmv_low/fmv_high/etc.
+    in the response. Post-split callers rely on the same shape — re-merge
+    the fmv row's columns into the response when grade is supplied."""
+    payload = {
+        "title": "ASM", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0,
+        "fmv_comps": 12, "fmv_confidence": "high", "fmv_notes": "key",
+    }
+    r = api.post("/api/comics", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["title"] == "ASM"
+    assert body["grade"] == 9.2
+    assert body["fmv_low"] == 800.0
+    assert body["fmv_high"] == 1000.0
+    assert body["fmv_comps"] == 12
+    assert body["fmv_confidence"] == "high"
+    assert body["fmv_notes"] == "key"
+
+
+def test_locg_link_response_includes_grade(api):
+    """Locg-link response previously included `grade`; restore it by joining
+    fmv to the comic's primary linkage."""
+    _seed_lot(api, "666000004")
+    r = api.post(
+        "/api/bids/666000004/comics/locg",
+        json={"locg_id": 7111218, "issue": "2"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "grade" in body
+    # Lot uses grade 9.4 from "_seed_lot" title.
+    assert body["grade"] == 9.4
+
+
 def test_e2e_distinct_fmv_per_grade_on_same_comic(api):
     api.mock_gixen.list_snipes.return_value = []
     r1 = api.post("/api/comics", json={

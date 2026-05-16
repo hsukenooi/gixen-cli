@@ -780,7 +780,10 @@ async def api_list_comics(
 @app.post("/api/comics")
 async def api_upsert_comic(req: UpsertComicRequest):
     """Upsert a comic identity (title/issue/year) and, if grade is supplied,
-    its per-grade fmv row. Flat request shape kept for backward compat."""
+    its per-grade fmv row. Flat request shape kept for backward compat —
+    when `grade` is supplied, the response also flattens the fmv columns
+    (grade/fmv_low/fmv_high/fmv_comps/fmv_confidence/fmv_notes) back into
+    the body so callers that round-trip request→response keep working."""
     db = _get_db()
     comic_id = upsert_comic(
         db, title=req.title, issue=req.issue, year=req.year,
@@ -794,7 +797,23 @@ async def api_upsert_comic(req: UpsertComicRequest):
             low=req.fmv_low, high=req.fmv_high, comps=req.fmv_comps,
             confidence=req.fmv_confidence, notes=req.fmv_notes,
         )
-    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
+        row = db.execute(
+            """
+            SELECT c.*, f.grade,
+                   f.low  AS fmv_low,
+                   f.high AS fmv_high,
+                   f.comps AS fmv_comps,
+                   f.confidence AS fmv_confidence,
+                   f.notes AS fmv_notes,
+                   f.updated_at AS fmv_updated_at
+            FROM comics c
+            JOIN fmv f ON f.comic_id = c.id
+            WHERE c.id=? AND f.grade=?
+            """,
+            (comic_id, req.grade),
+        ).fetchone()
+    else:
+        row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
 
 
@@ -967,6 +986,7 @@ async def api_get_snipes():
 
     rows = db.execute("""
         SELECT b.*,
+               c.id    AS comic_id,
                c.title AS comic_title,
                c.issue AS comic_issue,
                c.year  AS comic_year,
@@ -1055,6 +1075,7 @@ async def api_get_snipes():
             "fmv_notes": item.get("fmv_notes"),
             "fmv_warning": fmv_warning,
             "fmv_id": item.get("fmv_id"),
+            "comic_id": item.get("comic_id"),
             "locg_id": item.get("locg_id"),
             "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
@@ -1073,6 +1094,7 @@ async def api_get_history():
     db = _get_db()
     rows = db.execute("""
         SELECT b.*,
+               c.id    AS comic_id,
                c.title AS comic_title,
                c.issue AS comic_issue,
                c.year  AS comic_year,
@@ -1134,6 +1156,7 @@ async def api_get_history():
             "fmv_notes": item.get("fmv_notes"),
             "fmv_warning": fmv_warning,
             "fmv_id": item.get("fmv_id"),
+            "comic_id": item.get("comic_id"),
             "locg_id": item.get("locg_id"),
             "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
@@ -1148,6 +1171,7 @@ async def api_get_all_bids():
     db = _get_db()
     rows = db.execute("""
         SELECT b.*,
+               c.id    AS comic_id,
                c.title AS comic_title,
                c.issue AS comic_issue,
                c.year  AS comic_year,
@@ -1182,6 +1206,7 @@ async def api_get_all_bids():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "fmv_id": item.get("fmv_id"),
+            "comic_id": item.get("comic_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })
@@ -1338,14 +1363,41 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest):
         "FROM comics WHERE id = ?",
         (target_comic_id,),
     ).fetchone()
-    # is_primary derived from bid's fmv_id's comic
-    is_primary = False
+
+    # Resolve grade for response: the target_comic_id's fmv row at the grade
+    # implied by the bid's primary fmv linkage. With multiple grades on the
+    # same comic, prefer the one this junction is linked to.
+    grade: float | None = None
     if bid_row["fmv_id"] is not None:
-        primary_fmv_row = db.execute(
-            "SELECT comic_id FROM fmv WHERE id=?", (bid_row["fmv_id"],)
+        fmv_for_target = db.execute(
+            """
+            SELECT f.grade
+            FROM bid_fmvs bf
+            JOIN fmv f ON f.id = bf.fmv_id
+            WHERE bf.bid_id = ? AND f.comic_id = ?
+            LIMIT 1
+            """,
+            (bid_row["id"], target_comic_id),
         ).fetchone()
-        is_primary = (primary_fmv_row["comic_id"] == target_comic_id)
-    return {**dict(row), "is_primary": is_primary}
+        if fmv_for_target is not None:
+            grade = fmv_for_target["grade"]
+
+    # is_primary derived from bid_fmvs.is_primary for the target's fmv row
+    # (junction table is source of truth, not the bids.fmv_id mirror).
+    is_primary = False
+    target_fmv = db.execute(
+        """
+        SELECT bf.is_primary
+        FROM bid_fmvs bf
+        JOIN fmv f ON f.id = bf.fmv_id
+        WHERE bf.bid_id = ? AND f.comic_id = ?
+        LIMIT 1
+        """,
+        (bid_row["id"], target_comic_id),
+    ).fetchone()
+    if target_fmv is not None:
+        is_primary = bool(target_fmv["is_primary"])
+    return {**dict(row), "grade": grade, "is_primary": is_primary}
 
 
 @app.delete("/api/bids/{item_id}")
