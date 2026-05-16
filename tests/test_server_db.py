@@ -383,3 +383,36 @@ def test_migration_backfill_is_idempotent(tmp_path):
     ).fetchone()
     conn2.close()
     assert rows["n"] == 1
+
+
+def test_fmv_table_exists(db):
+    cur = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {row[0] for row in cur}
+    assert "fmv" in tables
+    assert "bid_fmvs" in tables
+
+
+def test_fmv_has_expected_columns(db):
+    cols = {row[1] for row in db.execute("PRAGMA table_info(fmv)")}
+    assert cols == {
+        "id", "comic_id", "grade", "low", "high", "comps",
+        "confidence", "notes", "updated_at",
+    }
+
+
+def test_fmv_unique_on_comic_and_grade(db):
+    sql = db.execute(
+        "SELECT sql FROM sqlite_master WHERE name='fmv'"
+    ).fetchone()["sql"]
+    normalized = sql.replace(" ", "")
+    assert "UNIQUE(comic_id,grade)" in normalized
+
+
+def test_bid_fmvs_has_expected_columns(db):
+    cols = {row[1] for row in db.execute("PRAGMA table_info(bid_fmvs)")}
+    assert cols == {"bid_id", "fmv_id", "is_primary"}
+
+
+def test_bids_fmv_id_column_exists(db):
+    cols = {row[1] for row in db.execute("PRAGMA table_info(bids)")}
+    assert "fmv_id" in cols

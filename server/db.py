@@ -54,6 +54,30 @@ CREATE TABLE IF NOT EXISTS bid_comics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bid_comics_bid ON bid_comics(bid_id);
+
+CREATE TABLE IF NOT EXISTS fmv (
+    id          INTEGER PRIMARY KEY,
+    comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    grade       REAL NOT NULL,
+    low         REAL,
+    high        REAL,
+    comps       INTEGER,
+    confidence  TEXT CHECK(confidence IN ('high', 'medium', 'low') OR confidence IS NULL),
+    notes       TEXT,
+    updated_at  TEXT,
+    UNIQUE(comic_id, grade)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id);
+
+CREATE TABLE IF NOT EXISTS bid_fmvs (
+    bid_id     INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+    fmv_id     INTEGER NOT NULL REFERENCES fmv(id)  ON DELETE CASCADE,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bid_id, fmv_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id);
 """
 
 
@@ -68,6 +92,10 @@ _COLUMN_MIGRATIONS = [
     # comics columns added since the original schema
     "ALTER TABLE comics ADD COLUMN locg_id INTEGER",
     "ALTER TABLE comics ADD COLUMN locg_variant_id INTEGER",
+    # FMV split (2026-05-13): fmv_id is the single FK from bids into the
+    # per-grade fmv table. ALTER is idempotent (caught by the
+    # "duplicate column" handler in _apply_migrations).
+    "ALTER TABLE bids ADD COLUMN fmv_id INTEGER REFERENCES fmv(id)",
 ]
 
 
