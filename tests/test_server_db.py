@@ -814,6 +814,240 @@ def test_migration_recovers_2026_05_13_incident(tmp_path):
         new.close()
 
 
+def test_migration_partial_failure_recovers(tmp_path, monkeypatch):
+    """Inject a failure inside the rebuild block. Migration must propagate the
+    exception, restore foreign_keys=ON, and leave the legacy tables intact so
+    the migration can be retried (no data loss)."""
+    path = tmp_path / "partial.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low) "
+        "VALUES (1, 'Hulk', '181', 1974, 9.0, 50)"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 1, 60)"
+    )
+    conn.commit()
+    conn.close()
+
+    # Patch the rebuild helper to raise. The migration must rollback cleanly
+    # so legacy `comics.grade` and `bids.comic_id` are still present.
+    import server.db as sdb
+    real_rebuild = sdb._rebuild_tables
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated mid-rebuild failure")
+
+    monkeypatch.setattr(sdb, "_rebuild_tables", boom)
+    with pytest.raises(RuntimeError, match="simulated mid-rebuild failure"):
+        init_db(path)
+
+    # Connect raw to inspect state. (PRAGMA foreign_keys is per-connection in
+    # SQLite, so we can't observe whether the migration's conn restored it
+    # via a fresh connection here — instead we check that re-running the
+    # migration converges, which proves recovery indirectly.)
+    raw = _sqlite3.connect(str(path))
+    raw.row_factory = _sqlite3.Row
+    try:
+        cols = {row[1] for row in raw.execute("PRAGMA table_info(comics)")}
+        assert "grade" in cols, "legacy column should still exist (rebuild rolled back)"
+        bids_cols = {row[1] for row in raw.execute("PRAGMA table_info(bids)")}
+        assert "comic_id" in bids_cols, "legacy bids.comic_id should still exist"
+        # comic 1 (the only one) is the survivor — it must still be reachable
+        # so re-running the migration converges.
+        row = raw.execute("SELECT title FROM comics WHERE id=1").fetchone()
+        assert row is not None
+        assert row["title"] == "Hulk"
+    finally:
+        raw.close()
+
+    # Un-patch and retry. With the real rebuild, init_db should succeed.
+    monkeypatch.setattr(sdb, "_rebuild_tables", real_rebuild)
+    new = init_db(path)
+    try:
+        row = new.execute("SELECT fmv_id FROM bids WHERE id=1").fetchone()
+        assert row["fmv_id"] is not None
+    finally:
+        new.close()
+
+
+def _build_legacy_db_no_unique(path):
+    """Like _build_legacy_db but without the UNIQUE(title,issue,year,grade)
+    constraint. Used to simulate legacy DBs that pre-date the constraint, where
+    two shadow rows at the same grade can coexist (the merge-on-conflict
+    branch's reason for existing)."""
+    conn = _sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = _sqlite3.Row
+    conn.executescript("""
+    CREATE TABLE comics (
+        id              INTEGER PRIMARY KEY,
+        title           TEXT NOT NULL,
+        issue           TEXT NOT NULL,
+        year            INTEGER NOT NULL,
+        grade           REAL,
+        fmv_low         REAL,
+        fmv_high        REAL,
+        fmv_comps       INTEGER,
+        fmv_confidence  TEXT,
+        fmv_notes       TEXT,
+        fmv_updated_at  TEXT,
+        locg_id         INTEGER,
+        locg_variant_id INTEGER,
+        created_at      TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE bids (
+        id              INTEGER PRIMARY KEY,
+        item_id         TEXT NOT NULL,
+        comic_id        INTEGER REFERENCES comics(id),
+        max_bid         REAL NOT NULL,
+        bid_offset      INTEGER DEFAULT 6,
+        snipe_group     INTEGER DEFAULT 0,
+        status          TEXT DEFAULT 'PENDING',
+        winning_bid     REAL,
+        seller          TEXT,
+        auction_end_at      TEXT,
+        local_snipe_at      TEXT,
+        local_snipe_result  TEXT,
+        notes               TEXT,
+        added_at            TEXT DEFAULT (datetime('now')),
+        resolved_at         TEXT,
+        ebay_title          TEXT,
+        status_mirror       TEXT,
+        cached_current_bid  TEXT,
+        cached_at           TEXT
+    );
+    CREATE TABLE bid_comics (
+        bid_id     INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+        comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bid_id, comic_id)
+    );
+    """)
+    conn.commit()
+    return conn
+
+
+def test_migration_tied_fmv_low_tiebreaks_by_updated_at(tmp_path):
+    """Two legacy shadow rows at the same grade with non-NULL fmv_low.
+    Tiebreak: the row with the most recent fmv_updated_at wins. Loser's notes
+    are preserved with a 'merged from legacy comic_id=X' prefix.
+
+    Uses a no-UNIQUE legacy schema to simulate the case the merge branch was
+    designed for (pre-UNIQUE legacy DBs)."""
+    path = tmp_path / "tied.db"
+    conn = _build_legacy_db_no_unique(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low, fmv_high, "
+        "fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at, locg_id) "
+        "VALUES (1, 'ASM', '300', 1988, 9.0, 800, 900, 5, 'high', 'older notes', "
+        "'2026-04-01T00:00:00', 11111)"
+    )
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low, fmv_high, "
+        "fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at) "
+        "VALUES (2, 'ASM', '300', 1988, 9.0, 850, 1000, 12, 'high', 'newer notes', "
+        "'2026-05-01T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        fmv = new.execute(
+            "SELECT low, high, notes, updated_at FROM fmv WHERE grade=9.0"
+        ).fetchone()
+        assert fmv is not None
+        # Newer row wins (850 vs 800).
+        assert fmv["low"] == 850
+        # Loser's notes preserved with merge prefix.
+        assert "merged from legacy comic_id=" in (fmv["notes"] or "")
+    finally:
+        new.close()
+
+
+def test_migration_dangling_bids_comic_id_does_not_crash(tmp_path):
+    """A bid pointing at a comic_id that doesn't exist must not abort the
+    migration. We pre-clean dangling refs and continue with .get() fallbacks.
+
+    Simulates the production reality where legacy bids may have been inserted
+    with FK enforcement off (the legacy bids.comic_id had no FK protection
+    until WAL mode + foreign_keys=ON was added)."""
+    path = tmp_path / "dangling.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (1, 'Hulk', '181', 1974, 9.0)"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 1, 60)"
+    )
+    # Bid 2 references comic 99 which doesn't exist (dangling) — insert with
+    # FK enforcement off to simulate the legacy data condition. PRAGMA must
+    # run outside any open transaction so commit first.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (2, '222', 99, 30)"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        # Migration completed — both bids survive, the dangling one has fmv_id NULL.
+        rows = new.execute("SELECT item_id, fmv_id FROM bids ORDER BY item_id").fetchall()
+        assert len(rows) == 2
+        by_item = {r["item_id"]: r["fmv_id"] for r in rows}
+        assert by_item["111"] is not None
+        assert by_item["222"] is None
+    finally:
+        new.close()
+
+
+def test_migration_fresh_db_uses_post_split_schema_directly(tmp_path):
+    """A brand-new DB skips the rebuild entirely. The post-split schema is the
+    source of truth in `_SCHEMA`; no legacy columns are ever created."""
+    path = tmp_path / "fresh.db"
+    conn = init_db(path)
+    try:
+        # Fresh DB has no legacy columns at all.
+        comic_cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
+        assert "grade" not in comic_cols
+        assert "fmv_low" not in comic_cols
+        bid_cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+        assert "comic_id" not in bid_cols
+        # No bid_comics table on a fresh DB.
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        assert "bid_comics" not in tables
+    finally:
+        conn.close()
+
+
+def test_migration_creates_backup_at_expected_path(tmp_path):
+    """When the migration runs (legacy DB), an automatic .pre-fmv-split.bak
+    file is created next to the live DB before the rebuild."""
+    path = tmp_path / "needs_backup.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (1, 'Hulk', '181', 1974, 9.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        bak = path.with_suffix(path.suffix + ".pre-fmv-split.bak")
+        assert bak.exists(), f"expected backup at {bak}"
+        # Backup is a real file with bytes (the legacy DB contents).
+        assert bak.stat().st_size > 0
+    finally:
+        new.close()
+
+
 def test_migration_post_state_drops_legacy_columns(tmp_path):
     """After migration: comics.grade, comics.fmv_*, bids.comic_id are gone."""
     path = tmp_path / "post.db"
