@@ -306,6 +306,64 @@ class TestAddSnipe:
     def test_add_not_confirmed_error_is_gixen_error(self):
         assert issubclass(GixenAddNotConfirmedError, GixenError)
 
+    def test_add_handles_202_duplicate_on_retry_as_success(self):
+        """Race: first POST landed but list_snipes verify missed it. Retry
+        POST raises GixenItemError(202) (already present). We re-check the
+        list and find the item — return True instead of bubbling the 202."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0
+
+        # POST 1 succeeds, POST 2 raises 202 (item already present).
+        post_calls = ["<html>OK</html>", GixenItemError(202, "ITEM ALREADY PRESENT")]
+        # list_snipes: first verify empty (missed it), retry list shows item.
+        list_calls = [[], [{"item_id": "777", "dbidid": "5099"}]]
+
+        def post_side_effect(*args, **kwargs):
+            result = post_calls.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch.object(client, "_post_home", side_effect=post_side_effect), \
+             patch.object(client, "list_snipes", side_effect=list_calls):
+            result = client.add_snipe("777", Decimal("10.00"))
+
+        assert result is True
+
+    def test_add_raises_add_not_confirmed_when_list_snipes_parse_fails(self):
+        """If list_snipes raises GixenParseError between POST and verify,
+        treat as unconfirmed and raise GixenAddNotConfirmedError immediately
+        rather than double-POSTing."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes", side_effect=GixenParseError("HTML drift")):
+            with pytest.raises(GixenAddNotConfirmedError):
+                client.add_snipe("999", Decimal("10.00"))
+
+        # Critical: only one POST. We must NOT retry when verify failed —
+        # that's the double-POST risk the safety guard exists to prevent.
+        assert mock_post.call_count == 1
+
+    def test_add_raises_add_not_confirmed_when_list_snipes_http_fails(self):
+        """Network error on verify: treat as unconfirmed, no double-POST."""
+        import requests as _req
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes", side_effect=_req.HTTPError("502")):
+            with pytest.raises(GixenAddNotConfirmedError):
+                client.add_snipe("999", Decimal("10.00"))
+        assert mock_post.call_count == 1
+
     def test_post_home_throttles_consecutive_posts(self):
         """Two _post_home calls in quick succession sleep to enforce minimum gap."""
         client = _client()

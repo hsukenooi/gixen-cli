@@ -329,6 +329,86 @@ def test_add_bid_gixen_error_returns_503(api):
     assert r.status_code == 503
 
 
+def test_add_bid_does_not_create_orphan_fmv_on_gixen_failure(api):
+    """When Gixen.add_snipe raises, the request must not leave behind a
+    committed fmv / comic / bid row. The upserts should be deferred until
+    after Gixen accepts (or rolled back if pre-committed)."""
+    from gixen_client import GixenError
+    api.mock_gixen.add_snipe.side_effect = GixenError("Gixen down")
+    r = api.post("/api/bids", json={
+        "item_id": "411222333",
+        "max_bid": 50.0,
+        "comic": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0,
+        "fmv_low": 50.0, "fmv_high": 70.0,
+        "fmv_comps": 8, "fmv_confidence": "high",
+    })
+    assert r.status_code == 503
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    # No bid row.
+    bid_rows = db.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id=?", ("411222333",)
+    ).fetchone()[0]
+    assert bid_rows == 0
+    # No orphan fmv (would be the only fmv row in the DB).
+    fmv_rows = db.execute("SELECT COUNT(*) FROM fmv").fetchone()[0]
+    assert fmv_rows == 0
+    # No orphan comic.
+    comic_rows = db.execute(
+        "SELECT COUNT(*) FROM comics WHERE title='Hulk' AND issue='181'"
+    ).fetchone()[0]
+    assert comic_rows == 0
+
+
+def test_add_bid_handles_add_not_confirmed_error_with_sync_recheck(api):
+    """If add_snipe raises GixenAddNotConfirmedError, the handler runs one
+    extra sync and re-checks. If the snipe is now present on Gixen, treat as
+    success rather than returning 503."""
+    from gixen_client import GixenAddNotConfirmedError
+
+    call_count = {"n": 0}
+
+    def add_then_appear(*args, **kwargs):
+        # First add_snipe call: appears unconfirmed. After that, list_snipes
+        # returns the item (the POST actually landed, just couldn't verify).
+        call_count["n"] += 1
+        api.mock_gixen.list_snipes.return_value = [{
+            "item_id": "412333444",
+            "title": "After verify",
+            "max_bid": "50.00 USD",
+            "current_bid": "5.00 USD",
+            "status": "SCHEDULED",
+            "time_to_end": "1h",
+            "seller": "s",
+            "snipe_group": "0",
+            "bid_offset": "6",
+            "bid_offset_mirror": "6",
+            "dbidid": "x1",
+        }]
+        raise GixenAddNotConfirmedError("412333444")
+
+    api.mock_gixen.add_snipe.side_effect = add_then_appear
+    r = api.post("/api/bids", json={"item_id": "412333444", "max_bid": 50.0})
+    assert r.status_code == 200, r.text
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    n = db.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id=?", ("412333444",)
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_add_bid_add_not_confirmed_still_missing_returns_503(api):
+    """If AddNotConfirmedError fires and sync re-check also doesn't see the
+    item, the handler must return 503 — don't swallow."""
+    from gixen_client import GixenAddNotConfirmedError
+    api.mock_gixen.add_snipe.side_effect = GixenAddNotConfirmedError("413444555")
+    api.mock_gixen.list_snipes.return_value = []
+    r = api.post("/api/bids", json={"item_id": "413444555", "max_bid": 50.0})
+    assert r.status_code == 503
+
+
 def test_get_snipes_empty(api):
     api.mock_gixen.list_snipes.return_value = []
     r = api.get("/api/snipes")

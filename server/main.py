@@ -18,7 +18,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
-from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
+from gixen_client import (
+    GixenClient, GixenError, GixenSnipeNotFoundError,
+    GixenAddNotConfirmedError, find_sibling_cleanup_targets,
+)
 from server.db import (
     DB_PATH, init_db, upsert_comic, upsert_fmv, set_bid_fmv,
     get_fmv_for_bid, link_fmv_to_bid, list_comics, insert_bid,
@@ -813,6 +816,41 @@ async def api_upsert_comic_fmv(comic_id: int, req: UpsertFmvRequest):
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
 
+    # Step 1: call Gixen FIRST. We don't create any local rows (comic, fmv,
+    # bid) until Gixen has accepted the snipe — otherwise a Gixen failure
+    # leaves orphan fmv/comic rows polluting the DB. The AddNotConfirmedError
+    # branch additionally falls back to a sync re-check before giving up,
+    # since the new verify-on-add path can produce false negatives.
+    try:
+        async with _api_lock:
+            await asyncio.to_thread(
+                _api_client.add_snipe,
+                req.item_id,
+                Decimal(str(req.max_bid)),
+                bid_offset=req.bid_offset,
+                snipe_group=req.snipe_group,
+            )
+    except GixenAddNotConfirmedError as e:
+        # Verify by syncing once: if the snipe is now visible on Gixen, the
+        # original POST actually landed despite the verify miss. Otherwise
+        # surface the 503 so the operator can investigate.
+        try:
+            async with _api_lock:
+                snipes = await _sync_gixen(db, _api_client)
+        except Exception:
+            logger.exception("api_add_bid: sync re-check after AddNotConfirmed failed")
+            snipes = []
+        if not any(s.get("item_id") == req.item_id for s in snipes):
+            raise HTTPException(status_code=503, detail=str(e))
+        # Sync also inserted the bid via the web-added branch — but with
+        # fmv_id=NULL. Fall through to the comic/fmv linkage below to mirror
+        # what a normal add path would have written.
+    except GixenError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
+
+    # Step 2: Gixen accepted. Materialize comic + fmv rows (if classified).
     fmv_id: int | None = None
     if req.comic and req.issue and req.year is not None:
         comic_id = upsert_comic(
@@ -831,29 +869,24 @@ async def api_add_bid(req: AddBidRequest):
                 confidence=req.fmv_confidence, notes=req.fmv_notes,
             )
 
-    try:
-        async with _api_lock:
-            await asyncio.to_thread(
-                _api_client.add_snipe,
-                req.item_id,
-                Decimal(str(req.max_bid)),
-                bid_offset=req.bid_offset,
-                snipe_group=req.snipe_group,
-            )
-    except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except requests.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
-
-    bid_id = insert_bid(
-        db,
-        item_id=req.item_id,
-        max_bid=req.max_bid,
-        fmv_id=fmv_id,
-        bid_offset=req.bid_offset,
-        snipe_group=req.snipe_group,
-        seller=None,
-    )
+    # Step 3: insert / link the bid. If a sync re-check (AddNotConfirmed
+    # recovery) already inserted the bid, reuse that row rather than create
+    # a duplicate.
+    existing = get_bid_by_item_id(db, req.item_id)
+    if existing is not None:
+        bid_id = existing["id"]
+        if fmv_id is not None:
+            set_bid_fmv(db, bid_id, fmv_id)
+    else:
+        bid_id = insert_bid(
+            db,
+            item_id=req.item_id,
+            max_bid=req.max_bid,
+            fmv_id=fmv_id,
+            bid_offset=req.bid_offset,
+            snipe_group=req.snipe_group,
+            seller=None,
+        )
     if fmv_id is not None:
         link_fmv_to_bid(db, bid_id, fmv_id, is_primary=True)
     row = db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
@@ -861,28 +894,63 @@ async def api_add_bid(req: AddBidRequest):
 
     # Surface a warning if this bid's fmv row has no valuation. Same dashboard
     # consequence as before (renders '—'); now the trigger is fmv.low IS NULL.
+    # Wrapped in try/except so a stray DB error during warning composition
+    # can never fail an already-successful add response.
     if fmv_id is not None:
-        fmv_row = db.execute(
-            "SELECT comic_id, low FROM fmv WHERE id=?", (fmv_id,)
-        ).fetchone()
-        if fmv_row is not None and fmv_row["low"] is None:
-            comic_row = db.execute(
-                "SELECT title, issue FROM comics WHERE id=?",
-                (fmv_row["comic_id"],),
-            ).fetchone()
-            logger.warning(
-                "bid added with no FMV for item_id=%s fmv_id=%s — "
-                "dashboard will render '—' for this row.",
-                req.item_id, fmv_id,
-            )
-            result["warning"] = (
-                f"fmv record for {comic_row['title']} #{comic_row['issue']} "
-                f"at grade {req.grade} has no valuation (low IS NULL). "
-                f"Dashboard will render '—'. Run /comic:fmv or POST "
-                f"/api/comics with FMV fields to fix."
-            )
+        try:
+            warning = _build_add_warning(db, fmv_id, req)
+        except Exception:
+            logger.exception("failed to compute fmv warning")
+            warning = None
+        if warning:
+            result["warning"] = warning
 
     return result
+
+
+def _build_add_warning(
+    db: sqlite3.Connection, fmv_id: int, req: "AddBidRequest"
+) -> str | None:
+    """Return a CLI/dashboard warning string when the fmv row this bid points
+    at has no valuation (low IS NULL). Echoes back the caller-supplied
+    title/issue/grade rather than persisted values so a future re-link
+    can't leak unrelated comic metadata into the response."""
+    fmv_row = db.execute(
+        "SELECT comic_id, low FROM fmv WHERE id=?", (fmv_id,)
+    ).fetchone()
+    if fmv_row is None or fmv_row["low"] is not None:
+        return None
+    # Prefer the caller's strings over the persisted comic row. If they
+    # diverge from what's in `comics`, surface the divergence so an operator
+    # can spot a mis-classification before it propagates.
+    comic_row = db.execute(
+        "SELECT title, issue FROM comics WHERE id=?",
+        (fmv_row["comic_id"],),
+    ).fetchone()
+    title = req.comic or (comic_row["title"] if comic_row else "?")
+    issue = req.issue or (comic_row["issue"] if comic_row else "?")
+    diverged = (
+        comic_row is not None
+        and req.comic is not None
+        and (comic_row["title"] != req.comic or comic_row["issue"] != req.issue)
+    )
+    logger.warning(
+        "bid added with no FMV for item_id=%s fmv_id=%s — "
+        "dashboard will render '—' for this row.",
+        req.item_id, fmv_id,
+    )
+    msg = (
+        f"fmv record for {title} #{issue} at grade {req.grade} has no "
+        f"valuation (low IS NULL). Dashboard will render '—'. Run "
+        f"/comic:fmv or POST /api/comics with FMV fields to fix."
+    )
+    if diverged:
+        msg += (
+            f" (note: persisted comic title/issue '{comic_row['title']} "
+            f"#{comic_row['issue']}' differs from request — caller may want "
+            f"to verify the linkage)"
+        )
+    return msg
 
 
 @app.get("/api/snipes")

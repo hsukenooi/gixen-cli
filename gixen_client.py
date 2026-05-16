@@ -351,7 +351,9 @@ class GixenClient:
             GixenItemError: If the item can't be added (not found, duplicate, etc.)
             GixenAddNotConfirmedError: If the POST returned no error but the snipe
                 never appeared in the snipe list (Gixen silently dropped it),
-                even after one retry.
+                even after one retry. Also raised when the verify list_snipes
+                itself fails (parse error, HTTP error) — in that case we cannot
+                tell whether the POST landed, so we refuse to double-POST.
         """
         data = {
             "newitemid": str(item_id),
@@ -364,7 +366,22 @@ class GixenClient:
         target = str(item_id)
 
         self._post_home(data)
-        if any(s["item_id"] == target for s in self.list_snipes()):
+
+        # Verify the POST landed. If list_snipes itself fails (parser drift,
+        # network blip), we can't know whether the POST succeeded — and
+        # double-POSTing in that uncertain state risks duplicate snipes. Bail
+        # with AddNotConfirmedError so the caller can investigate.
+        try:
+            snipes = self.list_snipes()
+        except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
+            logger.warning(
+                "add_snipe for item=%s: verify list_snipes failed (%s); "
+                "refusing to double-POST",
+                item_id, e,
+            )
+            raise GixenAddNotConfirmedError(item_id) from e
+
+        if any(s["item_id"] == target for s in snipes):
             logger.info("Added snipe: item=%s, max_bid=%s", item_id, max_bid)
             return True
 
@@ -377,8 +394,35 @@ class GixenClient:
         if self._add_retry_backoff:
             time.sleep(self._add_retry_backoff)
 
-        self._post_home(data)
-        if any(s["item_id"] == target for s in self.list_snipes()):
+        # Retry POST. Catch the eventual-consistency race: Gixen accepted the
+        # original POST but the verify GET was served from a stale view; the
+        # retry POST then trips ITEM ALREADY PRESENT (code 202). Treat 202 +
+        # subsequent verify-shows-item as success (the first POST really
+        # landed). Any other GixenItemError bubbles up.
+        try:
+            self._post_home(data)
+        except GixenItemError as e:
+            if e.code == 202:
+                try:
+                    snipes = self.list_snipes()
+                except (GixenParseError, requests.HTTPError, GixenSessionExpiredError):
+                    raise GixenAddNotConfirmedError(item_id) from e
+                if any(s["item_id"] == target for s in snipes):
+                    logger.info(
+                        "add_snipe for item=%s: first POST landed, retry hit "
+                        "202; treating as success", item_id,
+                    )
+                    return True
+                # 202 but verify still doesn't see it → genuinely confused.
+                raise GixenAddNotConfirmedError(item_id) from e
+            raise
+
+        try:
+            snipes = self.list_snipes()
+        except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
+            raise GixenAddNotConfirmedError(item_id) from e
+
+        if any(s["item_id"] == target for s in snipes):
             logger.info("Added snipe on retry: item=%s, max_bid=%s", item_id, max_bid)
             return True
 
