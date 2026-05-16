@@ -868,39 +868,49 @@ async def api_get_snipes():
     db = _get_db()
 
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
+        SELECT b.*,
+               c.title AS comic_title,
+               c.issue AS comic_issue,
+               c.year  AS comic_year,
+               f.grade AS comic_grade,
+               f.low   AS fmv_low,
+               f.high  AS fmv_high,
+               f.comps AS fmv_comps,
+               f.confidence AS fmv_confidence,
+               f.notes      AS fmv_notes,
                c.locg_id, c.locg_variant_id
         FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
+        LEFT JOIN fmv    f ON f.id = b.fmv_id
+        LEFT JOIN comics c ON c.id = f.comic_id
         WHERE b.status != 'PURGED'
         ORDER BY b.added_at DESC
     """).fetchall()
 
-    # Second query: every comic linked via bid_comics, keyed by bid_id. This
-    # gives us the full lot-aware view (1 bid → N comics) without disturbing
-    # the flat fields above (still populated from the primary via bids.comic_id).
+    # Second query: every fmv linked via bid_fmvs, keyed by bid_id. This
+    # gives us the full lot-aware view (1 bid → N fmv rows) without disturbing
+    # the flat fields above (still populated from the primary via bids.fmv_id).
     bid_ids = [r["id"] for r in rows]
     comics_by_bid: dict[int, list[dict]] = {bid_id: [] for bid_id in bid_ids}
     if bid_ids:
         placeholders = ",".join("?" * len(bid_ids))
         comic_rows = db.execute(
             f"""
-            SELECT bc.bid_id, bc.is_primary, c.id AS comic_id,
-                   c.title, c.issue, c.year, c.grade,
+            SELECT bf.bid_id, bf.is_primary,
+                   f.id AS fmv_id, f.comic_id, f.grade,
+                   c.title, c.issue, c.year,
                    c.locg_id, c.locg_variant_id
-            FROM bid_comics bc
-            JOIN comics c ON c.id = bc.comic_id
-            WHERE bc.bid_id IN ({placeholders})
-            ORDER BY bc.bid_id, bc.is_primary DESC,
+            FROM bid_fmvs bf
+            JOIN fmv    f ON f.id = bf.fmv_id
+            JOIN comics c ON c.id = f.comic_id
+            WHERE bf.bid_id IN ({placeholders})
+            ORDER BY bf.bid_id, bf.is_primary DESC,
                      CAST(c.issue AS INTEGER), c.issue
             """,
             bid_ids,
         ).fetchall()
         for cr in comic_rows:
             comics_by_bid[cr["bid_id"]].append({
+                "fmv_id": cr["fmv_id"],
                 "comic_id": cr["comic_id"],
                 "title": cr["title"],
                 "issue": cr["issue"],
@@ -916,6 +926,12 @@ async def api_get_snipes():
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
         title = item.get("ebay_title") or item.get("comic_title") or ""
+        fmv_warning = None
+        if item.get("fmv_id") is not None and item.get("fmv_low") is None:
+            fmv_warning = (
+                f"no FMV at grade {item.get('comic_grade')} for "
+                f"{item.get('comic_title') or '?'} #{item.get('comic_issue') or '?'}"
+            )
         result.append({
             "item_id": item["item_id"],
             "title": title,
@@ -939,7 +955,8 @@ async def api_get_snipes():
             "fmv_comps": item.get("fmv_comps"),
             "fmv_confidence": item.get("fmv_confidence"),
             "fmv_notes": item.get("fmv_notes"),
-            "comic_id": item.get("comic_id"),
+            "fmv_warning": fmv_warning,
+            "fmv_id": item.get("fmv_id"),
             "locg_id": item.get("locg_id"),
             "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
@@ -957,13 +974,20 @@ async def api_get_history():
     """
     db = _get_db()
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
+        SELECT b.*,
+               c.title AS comic_title,
+               c.issue AS comic_issue,
+               c.year  AS comic_year,
+               f.grade AS comic_grade,
+               f.low   AS fmv_low,
+               f.high  AS fmv_high,
+               f.comps AS fmv_comps,
+               f.confidence AS fmv_confidence,
+               f.notes      AS fmv_notes,
                c.locg_id, c.locg_variant_id
         FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
+        LEFT JOIN fmv    f ON f.id = b.fmv_id
+        LEFT JOIN comics c ON c.id = f.comic_id
         WHERE (
           b.auction_end_at IS NOT NULL
           AND datetime(b.auction_end_at) <= datetime('now')
@@ -981,6 +1005,12 @@ async def api_get_history():
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
         title = item.get("ebay_title") or item.get("comic_title") or ""
+        fmv_warning = None
+        if item.get("fmv_id") is not None and item.get("fmv_low") is None:
+            fmv_warning = (
+                f"no FMV at grade {item.get('comic_grade')} for "
+                f"{item.get('comic_title') or '?'} #{item.get('comic_issue') or '?'}"
+            )
         result.append({
             "item_id": item["item_id"],
             "title": title,
@@ -1004,7 +1034,8 @@ async def api_get_history():
             "fmv_comps": item.get("fmv_comps"),
             "fmv_confidence": item.get("fmv_confidence"),
             "fmv_notes": item.get("fmv_notes"),
-            "comic_id": item.get("comic_id"),
+            "fmv_warning": fmv_warning,
+            "fmv_id": item.get("fmv_id"),
             "locg_id": item.get("locg_id"),
             "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
@@ -1018,13 +1049,20 @@ async def api_get_all_bids():
     """All bids from the DB, newest first. Pure DB read — no Gixen sync."""
     db = _get_db()
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
+        SELECT b.*,
+               c.title AS comic_title,
+               c.issue AS comic_issue,
+               c.year  AS comic_year,
+               f.grade AS comic_grade,
+               f.low   AS fmv_low,
+               f.high  AS fmv_high,
+               f.comps AS fmv_comps,
+               f.confidence AS fmv_confidence,
+               f.notes      AS fmv_notes,
                c.locg_id, c.locg_variant_id
         FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
+        LEFT JOIN fmv    f ON f.id = b.fmv_id
+        LEFT JOIN comics c ON c.id = f.comic_id
         ORDER BY COALESCE(b.auction_end_at, b.added_at) DESC
     """).fetchall()
 
@@ -1045,7 +1083,7 @@ async def api_get_all_bids():
             "status_mirror": item.get("status_mirror"),
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
-            "comic_id": item.get("comic_id"),
+            "fmv_id": item.get("fmv_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })

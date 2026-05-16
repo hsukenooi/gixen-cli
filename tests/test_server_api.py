@@ -337,41 +337,73 @@ def test_get_snipes_empty(api):
 
 
 def test_get_snipes_merges_fmv(api):
-    # Add a bid with comic context first
-    api.post("/api/bids", json={
-        "item_id": "555666777",
-        "max_bid": 60.0,
-        "comic": "Hulk",
-        "issue": "181",
-        "year": 1974,
-        "grade": 9.0,
-        "fmv_low": 50.0,
-        "fmv_high": 70.0,
-        "fmv_comps": 8,
-        "fmv_confidence": "high",
-        "fmv_notes": "",
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 50.0, "fmv_high": 70.0,
+        "fmv_comps": 8, "fmv_confidence": "high",
     })
-    # Mock Gixen returning the same item
-    api.mock_gixen.list_snipes.return_value = [{
-        "item_id": "555666777",
-        "title": "Incredible Hulk #181",
-        "max_bid": "60.00 USD",
-        "current_bid": "45.00 USD",
-        "status": "SCHEDULED",
-        "time_to_end": "5h 0m",
-        "seller": "comicseller",
-        "snipe_group": "0",
-        "bid_offset": "6",
-        "bid_offset_mirror": "6",
-        "dbidid": "abc123",
-    }]
-    r = api.get("/api/snipes")
-    assert r.status_code == 200
-    snipes = r.json()
+    api.post("/api/bids", json={
+        "item_id": "987654321", "max_bid": 60.0,
+        "comic": "Hulk", "issue": "181", "year": 1974, "grade": 9.0,
+    })
+    snipes = api.get("/api/snipes").json()
     assert len(snipes) == 1
-    assert snipes[0]["item_id"] == "555666777"
     assert snipes[0]["fmv_low"] == 50.0
     assert snipes[0]["fmv_confidence"] == "high"
+    assert snipes[0]["comic_grade"] == 9.0
+
+
+def test_get_snipes_joins_fmv_via_fmv_id(api):
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 50.0, "fmv_high": 70.0,
+        "fmv_comps": 8, "fmv_confidence": "high",
+    })
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 7.0, "fmv_low": 20.0, "fmv_high": 30.0,
+        "fmv_comps": 5, "fmv_confidence": "medium",
+    })
+    api.post("/api/bids", json={
+        "item_id": "888000001", "max_bid": 60.0,
+        "comic": "Hulk", "issue": "181", "year": 1974, "grade": 9.0,
+    })
+    api.post("/api/bids", json={
+        "item_id": "888000002", "max_bid": 25.0,
+        "comic": "Hulk", "issue": "181", "year": 1974, "grade": 7.0,
+    })
+
+    snipes = api.get("/api/snipes").json()
+    by_item = {s["item_id"]: s for s in snipes}
+    assert by_item["888000001"]["fmv_low"] == 50.0
+    assert by_item["888000002"]["fmv_low"] == 20.0
+    assert by_item["888000001"]["comic_grade"] == 9.0
+    assert by_item["888000002"]["comic_grade"] == 7.0
+
+
+def test_get_snipes_null_valuation_surfaces_warning(api):
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/bids", json={
+        "item_id": "888000003", "max_bid": 1500.0,
+        "comic": "ASM", "issue": "300", "year": 1988, "grade": 9.4,
+    })
+    snipes = api.get("/api/snipes").json()
+    by_item = {s["item_id"]: s for s in snipes}
+    assert by_item["888000003"]["fmv_low"] is None
+    assert by_item["888000003"]["comic_grade"] == 9.4
+    assert by_item["888000003"].get("fmv_warning") is not None
+
+
+def test_get_snipes_unclassified_bid_has_no_warning(api):
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/bids", json={"item_id": "888000004", "max_bid": 250.0})
+    snipes = api.get("/api/snipes").json()
+    by_item = {s["item_id"]: s for s in snipes}
+    assert by_item["888000004"]["fmv_low"] is None
+    assert by_item["888000004"]["comic_grade"] is None
+    assert by_item["888000004"].get("fmv_warning") is None
 
 
 def test_get_snipes_serves_cached_data_when_gixen_down(api):
