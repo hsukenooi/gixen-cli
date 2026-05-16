@@ -1183,6 +1183,34 @@ def test_locg_link_auto_creates_missing_issue(api):
     assert issues == ["1", "2"]
 
 
+def test_locg_link_non_primary_returns_is_primary_false(api):
+    """The auto-create branch links a stub fmv with is_primary=False on the
+    junction table. The response's `is_primary` field must derive from
+    bid_fmvs.is_primary — NOT from comparing bids.fmv_id's comic to target.
+    Two pointers to "primary" risk divergence; the junction wins."""
+    api.mock_gixen.list_snipes.return_value = []
+    r = api.post("/api/bids", json={"item_id": "888000010", "max_bid": 10.0})
+    assert r.status_code == 200
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Daredevil The Man Without Fear #1 Marvel 1993 NM 9.4", "888000010"),
+    )
+    db.commit()
+    db.close()
+    api.post("/api/extract-comics")
+
+    # Link a different issue (#2) — auto-create branch, is_primary=False.
+    r = api.post(
+        "/api/bids/888000010/comics/locg",
+        json={"locg_id": 9999, "issue": "2"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_primary"] is False
+
+
 def test_locg_link_unknown_item_404(api):
     r = api.post(
         "/api/bids/000000000/comics/locg",
