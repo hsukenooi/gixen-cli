@@ -751,6 +751,63 @@ def test_migration_lot_with_grade_creates_one_bid_fmvs_per_comic(tmp_path):
         new.close()
 
 
+def test_migration_lot_with_mixed_per_comic_grades_preserves_each(tmp_path):
+    """A lot where the primary comic was graded 7.0 and the junction comics
+    have legacy grades 7.0, 8.5, and NULL. Post-migration each bid_fmvs row
+    points at the fmv row matching its OWN legacy grade; NULL falls back to
+    the primary's 7.0."""
+    path = tmp_path / "mixed_lot.db"
+    conn = _build_legacy_db(path)
+    # Primary comic (grade 7.0).
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (1, 'X-Men', '1', 1991, 7.0)"
+    )
+    # Junction comic with its own legacy grade 8.5.
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (2, 'X-Men', '2', 1991, 8.5)"
+    )
+    # Junction comic with NULL legacy grade.
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (3, 'X-Men', '3', 1991, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 1, 100)"
+    )
+    for cid, prim in ((1, 1), (2, 0), (3, 0)):
+        conn.execute(
+            "INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (1, ?, ?)",
+            (cid, prim),
+        )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        # Three bid_fmvs rows: one per junction entry.
+        junc = new.execute(
+            """
+            SELECT bf.is_primary, f.grade, c.issue
+            FROM bid_fmvs bf
+            JOIN fmv f ON f.id = bf.fmv_id
+            JOIN comics c ON c.id = f.comic_id
+            WHERE bf.bid_id = 1
+            ORDER BY c.issue
+            """
+        ).fetchall()
+        by_issue = {r["issue"]: r for r in junc}
+        # Issue 1 (primary): grade=7.0
+        assert by_issue["1"]["grade"] == 7.0
+        # Issue 2 (junction grade=8.5): grade=8.5 (NOT primary's 7.0)
+        assert by_issue["2"]["grade"] == 8.5
+        # Issue 3 (junction grade=NULL): falls back to primary's 7.0
+        assert by_issue["3"]["grade"] == 7.0
+    finally:
+        new.close()
+
+
 def test_migration_recovers_2026_05_13_incident(tmp_path):
     """14 bids spread across 4 shadow comics rows after grade revisions.
     Post-migration: one comics identity, 4 fmv rows, all 14 bids point at the
