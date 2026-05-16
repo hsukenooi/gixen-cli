@@ -1,5 +1,7 @@
 # Comic / FMV Schema Split Implementation Plan (v2)
 
+> **Snapshot at planning time — code is the source of truth.**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Normalize the schema so `comics` holds identity only, a new `fmv` table holds per-grade valuations, and `bids.fmv_id` is the single FK linking a listing to its (comic, grade) valuation row. This makes "bid has a grade with no FMV row" structurally impossible — the FK guarantees the row exists.
