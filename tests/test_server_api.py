@@ -80,32 +80,139 @@ def test_extract_comics_skips_unparseable(api):
 
 
 def test_upsert_comic(api):
-    r = api.post("/api/comics", json={
-        "title": "Amazing Spider-Man",
-        "issue": "300",
-        "year": 1988,
+    payload = {
+        "title": "Amazing Spider-Man", "issue": "300", "year": 1988,
         "grade": 9.2,
-        "fmv_low": 800.0,
-        "fmv_high": 1000.0,
-        "fmv_comps": 12,
-        "fmv_confidence": "high",
-        "fmv_notes": "Key issue",
-    })
+        "fmv_low": 800.0, "fmv_high": 1000.0,
+        "fmv_comps": 12, "fmv_confidence": "high", "fmv_notes": "Key issue",
+    }
+    r = api.post("/api/comics", json=payload)
     assert r.status_code == 200
-    data = r.json()
-    assert data["id"] > 0
-    assert data["title"] == "Amazing Spider-Man"
+    rows = api.get(
+        "/api/comics",
+        params={"title": "Amazing Spider-Man", "issue": "300", "year": 1988, "grade": 9.2},
+    ).json()
+    assert rows[0]["fmv_low"] == 800.0
+    assert rows[0]["fmv_confidence"] == "high"
 
 
 def test_upsert_comic_twice_updates(api):
     payload = {"title": "X-Men", "issue": "1", "year": 1963,
                "grade": 8.0, "fmv_low": 500.0, "fmv_high": 700.0,
                "fmv_comps": 5, "fmv_confidence": "medium", "fmv_notes": ""}
-    r1 = api.post("/api/comics", json=payload)
+    api.post("/api/comics", json=payload)
     payload["fmv_low"] = 550.0
-    r2 = api.post("/api/comics", json=payload)
-    assert r1.json()["id"] == r2.json()["id"]
-    assert r2.json()["fmv_low"] == 550.0
+    api.post("/api/comics", json=payload)
+    rows = api.get(
+        "/api/comics",
+        params={"title": "X-Men", "issue": "1", "year": 1963, "grade": 8.0},
+    ).json()
+    assert rows[0]["fmv_low"] == 550.0
+
+
+def test_post_comics_writes_identity_and_fmv(api):
+    payload = {
+        "title": "ASM", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0,
+        "fmv_comps": 12, "fmv_confidence": "high", "fmv_notes": "key",
+    }
+    r = api.post("/api/comics", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["title"] == "ASM"
+    rows = api.get(
+        "/api/comics",
+        params={"title": "ASM", "issue": "300", "year": 1988, "grade": 9.2},
+    ).json()
+    assert len(rows) == 1
+    assert rows[0]["fmv_low"] == 800.0
+    assert rows[0]["fmv_confidence"] == "high"
+
+
+def test_post_comics_no_grade_writes_identity_only(api):
+    r = api.post("/api/comics", json={"title": "Hulk", "issue": "181", "year": 1974})
+    assert r.status_code == 200
+    rows = api.get("/api/comics", params={"title": "Hulk", "grade": 9.0}).json()
+    assert rows == []
+
+
+def test_post_comics_grade_only_creates_fmv_stub(api):
+    """Grade supplied with no valuation fields creates an fmv row with NULL
+    low/high (preserves the FK invariant for future bids)."""
+    r = api.post("/api/comics", json={
+        "title": "X-Men", "issue": "1", "year": 1963, "grade": 8.0,
+    })
+    assert r.status_code == 200
+    rows = api.get(
+        "/api/comics",
+        params={"title": "X-Men", "issue": "1", "year": 1963, "grade": 8.0},
+    ).json()
+    assert len(rows) == 1
+    assert rows[0]["fmv_low"] is None
+    assert rows[0]["fmv_high"] is None
+    assert rows[0]["grade"] == 8.0
+
+
+def test_add_bid_routes_to_fmv_id(api):
+    payload = {
+        "item_id": "999111222",
+        "max_bid": 50.0,
+        "comic": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0,
+        "fmv_low": 50.0, "fmv_high": 70.0,
+        "fmv_comps": 8, "fmv_confidence": "high",
+    }
+    r = api.post("/api/bids", json=payload)
+    assert r.status_code == 200
+    bid_id = r.json()["id"]
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.row_factory = sqlite3.Row
+    bid = db.execute("SELECT fmv_id FROM bids WHERE id=?", (bid_id,)).fetchone()
+    assert bid["fmv_id"] is not None
+    fmv = db.execute(
+        "SELECT comic_id, grade, low FROM fmv WHERE id=?", (bid["fmv_id"],)
+    ).fetchone()
+    assert fmv["grade"] == 9.0
+    assert fmv["low"] == 50.0
+    comic = db.execute(
+        "SELECT title, issue, year FROM comics WHERE id=?", (fmv["comic_id"],)
+    ).fetchone()
+    assert (comic["title"], comic["issue"], comic["year"]) == ("Hulk", "181", 1974)
+    cols = {row[1] for row in db.execute("PRAGMA table_info(comics)")}
+    assert "grade" not in cols
+    assert "fmv_low" not in cols
+    bid_cols = {row[1] for row in db.execute("PRAGMA table_info(bids)")}
+    assert "comic_id" not in bid_cols
+
+
+def test_add_bid_grade_no_fmv_still_links(api):
+    """Grade without FMV: fmv row created with NULL low/high, bid still gets
+    fmv_id set, warning fires."""
+    r = api.post("/api/bids", json={
+        "item_id": "999111223",
+        "max_bid": 50.0,
+        "comic": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fmv_id"] is not None
+    assert body.get("warning") is not None
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.row_factory = sqlite3.Row
+    fmv = db.execute("SELECT low FROM fmv WHERE id=?", (body["fmv_id"],)).fetchone()
+    assert fmv["low"] is None
+
+
+def test_add_bid_no_comic_leaves_fmv_id_null(api):
+    """Bid with no comic flags should have fmv_id NULL and no warning."""
+    r = api.post("/api/bids", json={"item_id": "999111224", "max_bid": 25.0})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("fmv_id") is None
+    assert body.get("warning") is None
 
 
 def test_upsert_comic_missing_required_field(api):
@@ -141,11 +248,11 @@ def test_add_bid_with_comic_links_fmv(api):
     })
     assert r.status_code == 200
     data = r.json()
-    assert data["comic_id"] is not None
+    assert data["fmv_id"] is not None
 
 
 def test_add_bid_with_fmv_no_warning(api, caplog):
-    """Bid linked to a comic that has FMV → no warning field, no logger.warning."""
+    """Bid linked to an fmv row with valuation should not produce a warning."""
     import logging
     caplog.set_level(logging.WARNING, logger="server.main")
     r = api.post("/api/bids", json={
@@ -163,14 +270,14 @@ def test_add_bid_with_fmv_no_warning(api, caplog):
     })
     assert r.status_code == 200
     data = r.json()
-    assert data["comic_id"] is not None
+    assert data["fmv_id"] is not None
     assert "warning" not in data
     assert not any("no FMV" in rec.message for rec in caplog.records)
 
 
 def test_add_bid_with_null_fmv_emits_warning(api, caplog):
-    """Bid linked to a comic with NULL fmv_low → response has warning field,
-    logger.warning was called."""
+    """Bid linked to an fmv row with NULL low surfaces a warning field and
+    triggers a logger.warning."""
     import logging
     caplog.set_level(logging.WARNING, logger="server.main")
     r = api.post("/api/bids", json={
@@ -180,21 +287,18 @@ def test_add_bid_with_null_fmv_emits_warning(api, caplog):
         "issue": "1",
         "year": 1990,
         "grade": 9.0,
-        # No fmv_low, fmv_high — comic record will have NULL FMV
     })
     assert r.status_code == 200
     data = r.json()
-    assert data["comic_id"] is not None
+    assert data["fmv_id"] is not None
     assert "warning" in data
     assert "Mystery Comic" in data["warning"]
     assert "#1" in data["warning"]
-    assert "fmv_low IS NULL" in data["warning"]
-    # logger.warning was called with the no-FMV message
     assert any("no FMV" in rec.message for rec in caplog.records)
 
 
 def test_add_bid_without_comic_no_warning(api, caplog):
-    """Bid with no --comic flag (comic_id resolves to None) → no warning."""
+    """Bid with no comic flags should set fmv_id to NULL and produce no warning."""
     import logging
     caplog.set_level(logging.WARNING, logger="server.main")
     r = api.post("/api/bids", json={
@@ -203,7 +307,7 @@ def test_add_bid_without_comic_no_warning(api, caplog):
     })
     assert r.status_code == 200
     data = r.json()
-    assert data.get("comic_id") is None
+    assert data.get("fmv_id") is None
     assert "warning" not in data
     assert not any("no FMV" in rec.message for rec in caplog.records)
 

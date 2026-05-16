@@ -20,11 +20,12 @@ from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
 from server.db import (
-    DB_PATH, init_db, upsert_comic, list_comics, insert_bid, get_bid_by_item_id,
-    update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged, cache_gixen_data,
+    DB_PATH, init_db, upsert_comic, upsert_fmv, set_bid_fmv,
+    get_fmv_for_bid, link_fmv_to_bid, list_comics, insert_bid,
+    get_bid_by_item_id, update_bid, update_bid_status, delete_bid,
+    get_all_bids, get_pending_bids, mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
-    link_comic_to_bid, get_comics_for_bid, get_primary_comic_for_bid,
+    get_fmvs_for_bid, get_primary_fmv_for_bid,
 )
 from server.title_parser import parse_title
 import ebay_bidder
@@ -759,21 +760,21 @@ async def api_list_comics(
 
 @app.post("/api/comics")
 async def api_upsert_comic(req: UpsertComicRequest):
+    """Upsert a comic identity (title/issue/year) and, if grade is supplied,
+    its per-grade fmv row. Flat request shape kept for backward compat."""
     db = _get_db()
     comic_id = upsert_comic(
-        db,
-        title=req.title,
-        issue=req.issue,
-        year=req.year,
-        grade=req.grade,
-        fmv_low=req.fmv_low,
-        fmv_high=req.fmv_high,
-        fmv_comps=req.fmv_comps,
-        fmv_confidence=req.fmv_confidence,
-        fmv_notes=req.fmv_notes,
-        locg_id=req.locg_id,
-        locg_variant_id=req.locg_variant_id,
+        db, title=req.title, issue=req.issue, year=req.year,
+        locg_id=req.locg_id, locg_variant_id=req.locg_variant_id,
     )
+    if req.grade is not None:
+        # Always create the fmv row when a grade is given, even with NULL
+        # valuation. Schema invariant: a recorded grade must have an fmv row.
+        upsert_fmv(
+            db, comic_id=comic_id, grade=req.grade,
+            low=req.fmv_low, high=req.fmv_high, comps=req.fmv_comps,
+            confidence=req.fmv_confidence, notes=req.fmv_notes,
+        )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
 
@@ -782,22 +783,23 @@ async def api_upsert_comic(req: UpsertComicRequest):
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
 
-    comic_id = None
+    fmv_id: int | None = None
     if req.comic and req.issue and req.year is not None:
         comic_id = upsert_comic(
-            db,
-            title=req.comic,
-            issue=req.issue,
-            year=req.year,
-            grade=req.grade,
-            fmv_low=req.fmv_low,
-            fmv_high=req.fmv_high,
-            fmv_comps=req.fmv_comps,
-            fmv_confidence=req.fmv_confidence,
-            fmv_notes=req.fmv_notes,
-            locg_id=req.locg_id,
-            locg_variant_id=req.locg_variant_id,
+            db, title=req.comic, issue=req.issue, year=req.year,
+            locg_id=req.locg_id, locg_variant_id=req.locg_variant_id,
         )
+        if req.grade is not None:
+            # Caller (CLI / skill) supplied a grade explicitly, so materialize
+            # the (comic, grade) fmv row. NULL low/high is fine here: the
+            # caller has opted in to recording the grade. See Caveat #2 — the
+            # skill layer enforces that "silent on grade" produces no grade
+            # in this request, so we never reach this branch for silent flows.
+            fmv_id = upsert_fmv(
+                db, comic_id=comic_id, grade=req.grade,
+                low=req.fmv_low, high=req.fmv_high, comps=req.fmv_comps,
+                confidence=req.fmv_confidence, notes=req.fmv_notes,
+            )
 
     try:
         async with _api_lock:
@@ -817,31 +819,37 @@ async def api_add_bid(req: AddBidRequest):
         db,
         item_id=req.item_id,
         max_bid=req.max_bid,
-        comic_id=comic_id,
+        fmv_id=fmv_id,
         bid_offset=req.bid_offset,
         snipe_group=req.snipe_group,
         seller=None,
     )
+    if fmv_id is not None:
+        link_fmv_to_bid(db, bid_id, fmv_id, is_primary=True)
     row = db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
     result = dict(row)
 
-    # Defense-in-depth: surface a warning if we linked this bid to a comic
-    # record that has no FMV. The dashboard renders '—' for these rows, so
-    # callers (CLI, skill agents, direct API hits) should know to backfill.
-    if comic_id is not None:
-        comic_row = db.execute(
-            "SELECT title, issue, fmv_low FROM comics WHERE id=?", (comic_id,)
+    # Surface a warning if this bid's fmv row has no valuation. Same dashboard
+    # consequence as before (renders '—'); now the trigger is fmv.low IS NULL.
+    if fmv_id is not None:
+        fmv_row = db.execute(
+            "SELECT comic_id, low FROM fmv WHERE id=?", (fmv_id,)
         ).fetchone()
-        if comic_row is not None and comic_row["fmv_low"] is None:
+        if fmv_row is not None and fmv_row["low"] is None:
+            comic_row = db.execute(
+                "SELECT title, issue FROM comics WHERE id=?",
+                (fmv_row["comic_id"],),
+            ).fetchone()
             logger.warning(
-                "bid added with no FMV for item_id=%s comic_id=%s — "
+                "bid added with no FMV for item_id=%s fmv_id=%s — "
                 "dashboard will render '—' for this row.",
-                req.item_id, comic_id,
+                req.item_id, fmv_id,
             )
             result["warning"] = (
-                f"comic record for {comic_row['title']} #{comic_row['issue']} "
-                f"has no FMV (fmv_low IS NULL). Dashboard will render '—'. "
-                f"Run /comic:fmv or POST /api/comics with FMV fields to fix."
+                f"fmv record for {comic_row['title']} #{comic_row['issue']} "
+                f"at grade {req.grade} has no valuation (low IS NULL). "
+                f"Dashboard will render '—'. Run /comic:fmv or POST "
+                f"/api/comics with FMV fields to fix."
             )
 
     return result
