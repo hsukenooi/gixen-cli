@@ -628,22 +628,6 @@ class UpsertComicRequest(BaseModel):
         return v
 
 
-class UpsertFmvRequest(BaseModel):
-    grade: float
-    low: float | None = None
-    high: float | None = None
-    comps: int | None = None
-    confidence: str | None = None
-    notes: str | None = None
-
-    @field_validator("confidence")
-    @classmethod
-    def validate_confidence(cls, v: str | None) -> str | None:
-        if v is not None and v not in ("high", "medium", "low"):
-            raise ValueError("confidence must be high, medium, or low")
-        return v
-
-
 class AddBidRequest(BaseModel):
     item_id: str
     max_bid: float
@@ -814,20 +798,6 @@ async def api_upsert_comic(req: UpsertComicRequest):
         ).fetchone()
     else:
         row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
-    return dict(row)
-
-
-@app.post("/api/comics/{comic_id}/fmv")
-async def api_upsert_comic_fmv(comic_id: int, req: UpsertFmvRequest):
-    db = _get_db()
-    if db.execute("SELECT 1 FROM comics WHERE id=?", (comic_id,)).fetchone() is None:
-        raise HTTPException(status_code=404, detail=f"comic_id {comic_id} not found")
-    fmv_id = upsert_fmv(
-        db, comic_id=comic_id, grade=req.grade,
-        low=req.low, high=req.high, comps=req.comps,
-        confidence=req.confidence, notes=req.notes,
-    )
-    row = db.execute("SELECT * FROM fmv WHERE id=?", (fmv_id,)).fetchone()
     return dict(row)
 
 
