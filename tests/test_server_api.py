@@ -1122,6 +1122,31 @@ def test_locg_link_no_primary_without_issue_409(api):
     assert r.status_code == 409
 
 
+def test_post_comic_fmv_upserts_per_grade(api):
+    r = api.post("/api/comics", json={"title": "Hulk", "issue": "181", "year": 1974})
+    comic_id = r.json()["id"]
+    r = api.post(f"/api/comics/{comic_id}/fmv", json={
+        "grade": 9.0, "low": 50.0, "high": 70.0,
+        "comps": 8, "confidence": "high", "notes": "GPA",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["grade"] == 9.0
+    assert body["low"] == 50.0
+
+
+def test_post_comic_fmv_rejects_missing_grade(api):
+    r = api.post("/api/comics", json={"title": "Hulk", "issue": "181", "year": 1974})
+    comic_id = r.json()["id"]
+    r = api.post(f"/api/comics/{comic_id}/fmv", json={"low": 50.0})
+    assert r.status_code == 422
+
+
+def test_post_comic_fmv_unknown_comic_returns_404(api):
+    r = api.post("/api/comics/999999/fmv", json={"grade": 9.0, "low": 50.0})
+    assert r.status_code == 404
+
+
 def test_extract_comics_writes_fmv_stub_with_grade(api):
     api.mock_gixen.list_snipes.return_value = []
     r = api.post("/api/bids", json={"item_id": "777000111", "max_bid": 50.0})
