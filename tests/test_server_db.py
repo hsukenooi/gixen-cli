@@ -587,3 +587,328 @@ def test_fk_invariant_bid_fmvs_fmv_id_must_exist(db):
             (bid_id,),
         )
         db.commit()
+
+
+import sqlite3 as _sqlite3  # alias to avoid clash with sqlite3 used in fixtures
+
+
+def _build_legacy_db(path):
+    """Construct a DB at the pre-split schema, bypassing init_db's new code.
+    Mirrors the schema in production as of commit 941201f."""
+    conn = _sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = _sqlite3.Row
+    conn.executescript("""
+    CREATE TABLE comics (
+        id              INTEGER PRIMARY KEY,
+        title           TEXT NOT NULL,
+        issue           TEXT NOT NULL,
+        year            INTEGER NOT NULL,
+        grade           REAL,
+        fmv_low         REAL,
+        fmv_high        REAL,
+        fmv_comps       INTEGER,
+        fmv_confidence  TEXT,
+        fmv_notes       TEXT,
+        fmv_updated_at  TEXT,
+        locg_id         INTEGER,
+        locg_variant_id INTEGER,
+        created_at      TEXT DEFAULT (datetime('now')),
+        UNIQUE(title, issue, year, grade)
+    );
+    CREATE TABLE bids (
+        id              INTEGER PRIMARY KEY,
+        item_id         TEXT NOT NULL,
+        comic_id        INTEGER REFERENCES comics(id),
+        max_bid         REAL NOT NULL,
+        bid_offset      INTEGER DEFAULT 6,
+        snipe_group     INTEGER DEFAULT 0,
+        status          TEXT DEFAULT 'PENDING',
+        winning_bid     REAL,
+        seller          TEXT,
+        auction_end_at      TEXT,
+        local_snipe_at      TEXT,
+        local_snipe_result  TEXT,
+        notes               TEXT,
+        added_at            TEXT DEFAULT (datetime('now')),
+        resolved_at         TEXT,
+        ebay_title          TEXT,
+        status_mirror       TEXT,
+        cached_current_bid  TEXT,
+        cached_at           TEXT
+    );
+    CREATE TABLE bid_comics (
+        bid_id     INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+        comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bid_id, comic_id)
+    );
+    """)
+    conn.commit()
+    return conn
+
+
+def test_migration_collapses_shadow_rows_into_single_comic(tmp_path):
+    """Same (title, issue, year), three grades, only the first has FMV.
+    After migration: one comics row, three fmv rows (one per grade), bids
+    repointed to the matching fmv.id."""
+    path = tmp_path / "legacy.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low, fmv_high, "
+        "fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at, locg_id) "
+        "VALUES (42, 'Spider-Man', '300', 1988, 9.0, 800, 1000, 12, 'high', "
+        "'orig', '2026-05-01T00:00:00', 99999)"
+    )
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (58, 'Spider-Man', '300', 1988, 9.2)"
+    )
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (60, 'Spider-Man', '300', 1988, 8.0)"
+    )
+    conn.execute("INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 42, 700)")
+    conn.execute("INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (2, '222', 58, 900)")
+    conn.execute("INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (3, '333', 60, 400)")
+    conn.execute("INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (1, 42, 1)")
+    conn.execute("INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (2, 58, 1)")
+    conn.execute("INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (3, 60, 1)")
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        rows = new.execute(
+            "SELECT id, locg_id FROM comics WHERE title='Spider-Man' AND issue='300' AND year=1988"
+        ).fetchall()
+        assert len(rows) == 1
+        survivor_id = rows[0]["id"]
+        assert rows[0]["locg_id"] == 99999
+
+        fmv_rows = new.execute(
+            "SELECT id, grade, low FROM fmv WHERE comic_id=? ORDER BY grade",
+            (survivor_id,),
+        ).fetchall()
+        assert [r["grade"] for r in fmv_rows] == [8.0, 9.0, 9.2]
+        by_grade = {r["grade"]: r["low"] for r in fmv_rows}
+        assert by_grade[9.0] == 800.0
+        assert by_grade[9.2] is None
+        assert by_grade[8.0] is None
+
+        fmv_by_grade = {r["grade"]: r["id"] for r in fmv_rows}
+        bid_rows = new.execute(
+            "SELECT item_id, fmv_id FROM bids ORDER BY item_id"
+        ).fetchall()
+        bid_fmv_by_item = {r["item_id"]: r["fmv_id"] for r in bid_rows}
+        assert bid_fmv_by_item["111"] == fmv_by_grade[9.0]
+        assert bid_fmv_by_item["222"] == fmv_by_grade[9.2]
+        assert bid_fmv_by_item["333"] == fmv_by_grade[8.0]
+
+        junc_rows = new.execute(
+            "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs ORDER BY bid_id"
+        ).fetchall()
+        assert {(r["bid_id"], r["fmv_id"]) for r in junc_rows} == {
+            (1, fmv_by_grade[9.0]),
+            (2, fmv_by_grade[9.2]),
+            (3, fmv_by_grade[8.0]),
+        }
+        assert all(r["is_primary"] == 1 for r in junc_rows)
+    finally:
+        new.close()
+
+
+def test_migration_is_idempotent(tmp_path):
+    """Running init_db on an already-migrated DB is a no-op."""
+    path = tmp_path / "idem.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low) "
+        "VALUES (1, 'Hulk', '181', 1974, 9.0, 50)"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 1, 60)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn1 = init_db(path)
+    cc1 = conn1.execute("SELECT COUNT(*) AS n FROM comics").fetchone()["n"]
+    fc1 = conn1.execute("SELECT COUNT(*) AS n FROM fmv").fetchone()["n"]
+    bf1 = conn1.execute("SELECT fmv_id FROM bids WHERE id=1").fetchone()["fmv_id"]
+    conn1.close()
+
+    conn2 = init_db(path)
+    cc2 = conn2.execute("SELECT COUNT(*) AS n FROM comics").fetchone()["n"]
+    fc2 = conn2.execute("SELECT COUNT(*) AS n FROM fmv").fetchone()["n"]
+    bf2 = conn2.execute("SELECT fmv_id FROM bids WHERE id=1").fetchone()["fmv_id"]
+    conn2.close()
+
+    assert cc1 == cc2 == 1
+    assert fc1 == fc2 == 1
+    assert bf1 == bf2 is not None
+
+
+def test_migration_handles_null_grade_bid(tmp_path):
+    """Bid with comic_id but no grade on the linked comic → fmv_id stays NULL,
+    bid stays in the table (it's still a real auction we're tracking)."""
+    path = tmp_path / "null.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade) "
+        "VALUES (1, 'Hulk', '181', 1974, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 1, 60)"
+    )
+    conn.execute(
+        "INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (1, 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        bid = new.execute(
+            "SELECT id, fmv_id FROM bids WHERE id=1"
+        ).fetchone()
+        assert bid is not None
+        assert bid["fmv_id"] is None
+        fmv_count = new.execute("SELECT COUNT(*) AS n FROM fmv").fetchone()["n"]
+        assert fmv_count == 0
+        junc_count = new.execute("SELECT COUNT(*) AS n FROM bid_fmvs").fetchone()["n"]
+        assert junc_count == 0
+    finally:
+        new.close()
+
+
+def test_migration_preserves_orphan_fmv(tmp_path):
+    """A legacy comics row with FMV but no bids still gets an fmv row so the
+    valuation isn't lost."""
+    path = tmp_path / "orphan.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low) "
+        "VALUES (1, 'X-Men', '1', 1963, 8.0, 5000)"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        fmv = new.execute("SELECT low FROM fmv WHERE grade=8.0").fetchone()
+        assert fmv is not None
+        assert fmv["low"] == 5000.0
+    finally:
+        new.close()
+
+
+def test_migration_survivor_prefers_locg_then_fmv(tmp_path):
+    path = tmp_path / "survivor.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, locg_id) "
+        "VALUES (10, 'ASM', '300', 1988, 9.4, 11111)"
+    )
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low) "
+        "VALUES (20, 'ASM', '300', 1988, 9.2, 800)"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        survivor = new.execute(
+            "SELECT id, locg_id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+        ).fetchone()
+        assert survivor["locg_id"] == 11111
+        grades = {r["grade"] for r in new.execute(
+            "SELECT grade FROM fmv WHERE comic_id=?", (survivor["id"],)
+        )}
+        assert grades == {9.2, 9.4}
+        fmv92 = new.execute(
+            "SELECT low FROM fmv WHERE comic_id=? AND grade=9.2",
+            (survivor["id"],),
+        ).fetchone()
+        assert fmv92["low"] == 800
+    finally:
+        new.close()
+
+
+def test_migration_lot_with_grade_creates_one_bid_fmvs_per_comic(tmp_path):
+    """bid_comics row over a 3-issue lot, bid grade=6.0 → 3 bid_fmvs rows,
+    each pointing to an fmv at grade 6.0 for the respective comic."""
+    path = tmp_path / "lot.db"
+    conn = _build_legacy_db(path)
+    for i, cid in enumerate((101, 102, 103), start=1):
+        conn.execute(
+            "INSERT INTO comics (id, title, issue, year, grade) "
+            "VALUES (?, 'Daredevil', ?, 1993, 6.0)",
+            (cid, str(i)),
+        )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 101, 100)"
+    )
+    for cid in (101, 102, 103):
+        conn.execute(
+            "INSERT INTO bid_comics (bid_id, comic_id, is_primary) VALUES (1, ?, ?)",
+            (cid, 1 if cid == 101 else 0),
+        )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        comic_ids = {
+            r["id"] for r in new.execute(
+                "SELECT id FROM comics WHERE title='Daredevil'"
+            )
+        }
+        assert len(comic_ids) == 3
+        fmv_rows = new.execute("SELECT id, grade FROM fmv").fetchall()
+        assert {r["grade"] for r in fmv_rows} == {6.0}
+        assert len(fmv_rows) == 3
+        junc = new.execute(
+            "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs WHERE bid_id=1"
+        ).fetchall()
+        assert len(junc) == 3
+        primary = [r for r in junc if r["is_primary"] == 1]
+        assert len(primary) == 1
+        primary_fmv_id = primary[0]["fmv_id"]
+        bid_fmv = new.execute("SELECT fmv_id FROM bids WHERE id=1").fetchone()["fmv_id"]
+        assert bid_fmv == primary_fmv_id
+    finally:
+        new.close()
+
+
+def test_migration_post_state_drops_legacy_columns(tmp_path):
+    """After migration: comics.grade, comics.fmv_*, bids.comic_id are gone."""
+    path = tmp_path / "post.db"
+    conn = _build_legacy_db(path)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year, grade, fmv_low) "
+        "VALUES (1, 'Hulk', '181', 1974, 9.0, 50)"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, comic_id, max_bid) VALUES (1, '111', 1, 60)"
+    )
+    conn.commit()
+    conn.close()
+
+    new = init_db(path)
+    try:
+        comic_cols = {row[1] for row in new.execute("PRAGMA table_info(comics)")}
+        bid_cols = {row[1] for row in new.execute("PRAGMA table_info(bids)")}
+        assert "grade" not in comic_cols
+        assert "fmv_low" not in comic_cols
+        assert "fmv_high" not in comic_cols
+        assert "fmv_comps" not in comic_cols
+        assert "fmv_confidence" not in comic_cols
+        assert "fmv_notes" not in comic_cols
+        assert "fmv_updated_at" not in comic_cols
+        assert "comic_id" not in bid_cols
+        assert "grade" not in bid_cols
+        assert "fmv_id" in bid_cols
+    finally:
+        new.close()

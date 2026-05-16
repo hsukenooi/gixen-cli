@@ -111,15 +111,305 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             if "duplicate column" not in str(e).lower():
                 raise
 
-    # Backfill bid_comics from existing bids.comic_id values. INSERT OR IGNORE
-    # makes this idempotent — re-running on an already-migrated DB is a no-op.
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO bid_comics (bid_id, comic_id, is_primary)
-        SELECT id, comic_id, 1 FROM bids WHERE comic_id IS NOT NULL
-        """
-    )
+    # Legacy backfill from before bid_comics existed. Only runs while the
+    # legacy bids.comic_id column still exists (i.e. pre-FMV-split DB).
+    bid_cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    if "comic_id" in bid_cols:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bid_comics (bid_id, comic_id, is_primary)
+            SELECT id, comic_id, 1 FROM bids WHERE comic_id IS NOT NULL
+            """
+        )
+        conn.commit()
+
+    _migrate_fmv_split(conn)
+
+
+def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
+    """Collapse comics shadow rows, manufacture fmv rows for every legacy
+    (comic_id, grade) pair, and repoint bids/junction at the new fmv_id.
+
+    Idempotent — gated on the presence of the legacy `comics.grade` column.
+    Once the rebuild step runs, this column is gone and the function returns
+    immediately on subsequent calls.
+
+    Survivor priority: locg_id NOT NULL > fmv_low NOT NULL > most recent
+    fmv_updated_at > lowest id."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
+    if "grade" not in cols:
+        return  # already migrated
+
+    import logging
+    log = logging.getLogger(__name__)
+
+    # 1. Compute survivor id per (title, issue, year) group.
+    survivors = conn.execute("""
+        SELECT title, issue, year,
+               (SELECT id FROM comics c2
+                WHERE c2.title=c1.title AND c2.issue=c1.issue AND c2.year=c1.year
+                ORDER BY
+                  CASE WHEN c2.locg_id        IS NOT NULL THEN 0 ELSE 1 END,
+                  CASE WHEN c2.fmv_low        IS NOT NULL THEN 0 ELSE 1 END,
+                  CASE WHEN c2.fmv_updated_at IS NULL    THEN 1 ELSE 0 END,
+                  c2.fmv_updated_at DESC,
+                  c2.id ASC
+                LIMIT 1) AS survivor_id
+        FROM comics c1
+        GROUP BY title, issue, year
+    """).fetchall()
+    survivor_map: dict[tuple[str, str, int], int] = {
+        (r["title"], r["issue"], r["year"]): r["survivor_id"] for r in survivors
+    }
+
+    # 2. Build fmv rows. For every legacy comic row with grade IS NOT NULL,
+    #    insert an fmv row at (survivor_id, grade) carrying the legacy
+    #    valuation tuple. Conflicts on (survivor_id, grade) resolved by
+    #    "row with fmv_low NOT NULL wins"; the loser's notes are prefixed.
+    legacy_rows = conn.execute(
+        "SELECT id, title, issue, year, grade, fmv_low, fmv_high, fmv_comps, "
+        "fmv_confidence, fmv_notes, fmv_updated_at "
+        "FROM comics"
+    ).fetchall()
+    legacy_to_survivor: dict[int, int] = {
+        r["id"]: survivor_map[(r["title"], r["issue"], r["year"])]
+        for r in legacy_rows
+    }
+    fmv_inserted = 0
+    for row in legacy_rows:
+        if row["grade"] is None:
+            continue
+        survivor_id = legacy_to_survivor[row["id"]]
+        existing = conn.execute(
+            "SELECT id, low FROM fmv WHERE comic_id=? AND grade=?",
+            (survivor_id, row["grade"]),
+        ).fetchone()
+        if existing is not None:
+            if existing["low"] is None and row["fmv_low"] is not None:
+                conn.execute(
+                    """
+                    UPDATE fmv
+                    SET low=?, high=?, comps=?, confidence=?,
+                        notes = COALESCE(?, notes),
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (row["fmv_low"], row["fmv_high"], row["fmv_comps"],
+                     row["fmv_confidence"],
+                     f"[merged from legacy comic_id={row['id']}] "
+                     + (row["fmv_notes"] or ""),
+                     row["fmv_updated_at"], existing["id"]),
+                )
+            else:
+                log.info(
+                    "fmv split: skip legacy comic_id=%s grade=%s "
+                    "(survivor fmv row already has valuation)",
+                    row["id"], row["grade"],
+                )
+            continue
+        conn.execute(
+            """
+            INSERT INTO fmv (comic_id, grade, low, high, comps,
+                             confidence, notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (survivor_id, row["grade"], row["fmv_low"], row["fmv_high"],
+             row["fmv_comps"], row["fmv_confidence"], row["fmv_notes"],
+             row["fmv_updated_at"]),
+        )
+        fmv_inserted += 1
+
+    # 3. (comic_id, grade) → fmv_id lookup used by steps 4 and 5.
+    fmv_lookup_rows = conn.execute("SELECT id, comic_id, grade FROM fmv").fetchall()
+    fmv_by_pair: dict[tuple[int, float], int] = {
+        (r["comic_id"], r["grade"]): r["id"] for r in fmv_lookup_rows
+    }
+    legacy_grade: dict[int, float | None] = {
+        r["id"]: r["grade"] for r in legacy_rows
+    }
+
+    # 4. Repoint bids. For each bid with comic_id NOT NULL, resolve survivor
+    #    and grade, look up fmv_id, set bids.fmv_id.
+    bids_linked = 0
+    bids_with_null = 0
+    bid_rows = conn.execute(
+        "SELECT id, comic_id FROM bids WHERE comic_id IS NOT NULL"
+    ).fetchall()
+    for b in bid_rows:
+        legacy_cid = b["comic_id"]
+        survivor_id = legacy_to_survivor[legacy_cid]
+        grade = legacy_grade[legacy_cid]
+        if grade is None:
+            bids_with_null += 1
+            continue
+        fmv_id = fmv_by_pair[(survivor_id, grade)]
+        conn.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fmv_id, b["id"]))
+        bids_linked += 1
+
+    # 5. Migrate bid_comics → bid_fmvs. Resolve via the bid's primary grade
+    #    (which is the legacy comics.grade of bids.comic_id). Junction rows
+    #    whose bid has no resolvable grade are skipped.
+    junction_inserted = 0
+    junction_skipped = 0
+    bc_rows = conn.execute(
+        "SELECT bc.bid_id, bc.comic_id, bc.is_primary "
+        "FROM bid_comics bc "
+        "JOIN bids b ON b.id = bc.bid_id"
+    ).fetchall()
+    for bc in bc_rows:
+        bid_row = conn.execute(
+            "SELECT comic_id FROM bids WHERE id=?", (bc["bid_id"],)
+        ).fetchone()
+        if bid_row is None or bid_row["comic_id"] is None:
+            junction_skipped += 1
+            continue
+        grade = legacy_grade[bid_row["comic_id"]]
+        if grade is None:
+            junction_skipped += 1
+            continue
+        survivor_id = legacy_to_survivor[bc["comic_id"]]
+        key = (survivor_id, grade)
+        if key not in fmv_by_pair:
+            # Junction comic didn't carry this grade in legacy data; create
+            # a NULL-valuation fmv stub so the junction row can land.
+            conn.execute(
+                "INSERT INTO fmv (comic_id, grade, updated_at) VALUES (?, ?, NULL)",
+                (survivor_id, grade),
+            )
+            new_id = conn.execute(
+                "SELECT id FROM fmv WHERE comic_id=? AND grade=?",
+                (survivor_id, grade),
+            ).fetchone()["id"]
+            fmv_by_pair[key] = new_id
+        fmv_id = fmv_by_pair[key]
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary)
+            VALUES (?, ?, ?)
+            """,
+            (bc["bid_id"], fmv_id, bc["is_primary"]),
+        )
+        junction_inserted += 1
+
+    # 6. Delete non-survivor comics rows. The legacy bids.comic_id and
+    #    bid_comics still reference these shadow rows, but those tables are
+    #    about to be rebuilt (step 7) and the new schema doesn't carry that
+    #    FK. Disable FK enforcement for the delete and rebuild as a single
+    #    block. PRAGMA foreign_keys is a no-op inside a transaction, so
+    #    commit any pending writes first.
     conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+
+    survivor_ids = list({s for s in survivor_map.values()})
+    if survivor_ids:
+        placeholders = ",".join("?" * len(survivor_ids))
+        conn.execute(
+            f"DELETE FROM comics WHERE id NOT IN ({placeholders})",
+            survivor_ids,
+        )
+    collapsed = len(legacy_rows) - len(survivor_ids)
+
+    # 7. Rebuild comics and bids to drop legacy columns. SQLite has no DROP
+    #    COLUMN before 3.35 and no DROP CONSTRAINT at all, so use the standard
+    #    rename-and-rebuild dance. Wrap in a savepoint so a failure leaves
+    #    the DB recoverable (caller restores from backup).
+    #
+    #    This is the standard pattern documented at sqlite.org/lang_altertable.html
+    #    (section 7, "Making other kinds of table schema changes").
+    conn.execute("SAVEPOINT fmv_split_rebuild")
+    try:
+        # Comics: drop grade, fmv_*, change UNIQUE to (title, issue, year).
+        conn.execute("ALTER TABLE comics RENAME TO comics_legacy")
+        conn.execute("""
+            CREATE TABLE comics (
+                id              INTEGER PRIMARY KEY,
+                title           TEXT NOT NULL,
+                issue           TEXT NOT NULL,
+                year            INTEGER NOT NULL,
+                locg_id         INTEGER,
+                locg_variant_id INTEGER,
+                created_at      TEXT DEFAULT (datetime('now')),
+                UNIQUE(title, issue, year)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO comics
+            (id, title, issue, year, locg_id, locg_variant_id, created_at)
+            SELECT id, title, issue, year, locg_id, locg_variant_id, created_at
+            FROM comics_legacy
+        """)
+        conn.execute("DROP TABLE comics_legacy")
+
+        # Bids: drop comic_id. fmv_id is already populated.
+        conn.execute("ALTER TABLE bids RENAME TO bids_legacy")
+        conn.execute("""
+            CREATE TABLE bids (
+                id                  INTEGER PRIMARY KEY,
+                item_id             TEXT NOT NULL,
+                fmv_id              INTEGER REFERENCES fmv(id),
+                max_bid             REAL NOT NULL,
+                bid_offset          INTEGER DEFAULT 6,
+                snipe_group         INTEGER DEFAULT 0,
+                status              TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
+                winning_bid         REAL,
+                seller              TEXT,
+                auction_end_at      TEXT,
+                local_snipe_at      TEXT,
+                local_snipe_result  TEXT,
+                notes               TEXT,
+                ebay_title          TEXT,
+                status_mirror       TEXT,
+                cached_current_bid  TEXT,
+                cached_at           TEXT,
+                added_at            TEXT DEFAULT (datetime('now')),
+                resolved_at         TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO bids (
+                id, item_id, fmv_id, max_bid, bid_offset, snipe_group, status,
+                winning_bid, seller, auction_end_at, local_snipe_at,
+                local_snipe_result, notes, ebay_title, status_mirror,
+                cached_current_bid, cached_at, added_at, resolved_at
+            )
+            SELECT
+                id, item_id, fmv_id, max_bid, bid_offset, snipe_group, status,
+                winning_bid, seller, auction_end_at, local_snipe_at,
+                local_snipe_result, notes, ebay_title, status_mirror,
+                cached_current_bid, cached_at, added_at, resolved_at
+            FROM bids_legacy
+        """)
+        conn.execute("DROP TABLE bids_legacy")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_fmv ON bids(fmv_id)")
+
+        # bid_comics: drop entirely — replaced by bid_fmvs.
+        conn.execute("DROP TABLE IF EXISTS bid_comics")
+
+        # PRAGMA foreign_key_check before release: catch dangling FKs in the
+        # rebuilt tables. If the migration logic is sound, this returns no rows.
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(
+                f"fmv split migration: FK violations after rebuild: {violations}"
+            )
+        conn.execute("RELEASE fmv_split_rebuild")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT fmv_split_rebuild")
+        conn.execute("RELEASE fmv_split_rebuild")
+        conn.execute("PRAGMA foreign_keys=ON")
+        raise
+
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.commit()
+
+    log.warning(
+        "FMV split migration complete: collapsed %d shadow comics, "
+        "inserted %d fmv rows, linked %d bids to fmv_id (%d bids left with NULL "
+        "fmv_id due to missing grade), migrated %d bid_fmvs junction rows (skipped %d).",
+        collapsed, fmv_inserted, bids_linked, bids_with_null,
+        junction_inserted, junction_skipped,
+    )
 
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
