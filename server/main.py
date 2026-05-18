@@ -48,6 +48,22 @@ except ImportError as _ebay_import_err:
 
 logger = logging.getLogger(__name__)
 
+# The host configures the plugin subsystem's logger explicitly so the audit
+# trail emitted by load_plugins() (plugin discovery, registration, validation
+# errors) is visible at INFO. Uvicorn does not configure the root logger by
+# default, so propagation alone wouldn't show these messages — attach a
+# stream handler with a uvicorn-style prefix so the lines blend into the
+# normal startup log.
+_plugin_logger = logging.getLogger("gixen.plugins")
+_plugin_logger.setLevel(logging.INFO)
+if not _plugin_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:     gixen.plugins: %(message)s"))
+    _plugin_logger.addHandler(_h)
+# Note: propagate stays True so pytest's caplog (which attaches to root) can
+# capture these records in tests. Uvicorn's default config attaches no root
+# handler, so propagation does not cause double-logging in production.
+
 if not _EBAY_AVAILABLE:
     logger.warning("ebay_fetch not importable from %s — live eBay data disabled", _EBAY_CLI_DIR)
 
