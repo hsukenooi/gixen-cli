@@ -1,11 +1,77 @@
 """HTTP endpoint tests — GixenClient is mocked, DB uses tmp_path."""
+import sys
+import os
+import types
 import pytest
+from importlib.metadata import EntryPoint
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
-import sys
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _install_plugins(monkeypatch, plugins: dict):
+    eps = []
+    for name, mod in plugins.items():
+        module_name = f"_test_api_{name.replace('-', '_')}"
+        monkeypatch.setitem(sys.modules, module_name, mod)
+        eps.append(EntryPoint(name=name, value=module_name, group="gixen.plugins"))
+    monkeypatch.setattr(
+        "gixen.plugins.entry_points",
+        lambda group: eps if group == "gixen.plugins" else [],
+    )
+
+
+def _make_comic_schema_plugin():
+    """Stub plugin that creates comics/bid_comics via register_db_tables.
+
+    Used by the api fixture so all comic-route tests remain green after PER-27
+    moves these tables out of core's _SCHEMA. Uses individual conn.execute()
+    calls (never executescript) per the register_db_tables hookspec contract.
+    """
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("_comic_stub_plugin")
+
+    @hookimpl
+    def register_db_tables(conn):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS comics (
+                id              INTEGER PRIMARY KEY,
+                title           TEXT NOT NULL,
+                issue           TEXT NOT NULL,
+                year            INTEGER NOT NULL,
+                grade           REAL,
+                fmv_low         REAL,
+                fmv_high        REAL,
+                fmv_comps       INTEGER,
+                fmv_confidence  TEXT CHECK(fmv_confidence IN ('high', 'medium', 'low') OR fmv_confidence IS NULL),
+                fmv_notes       TEXT,
+                fmv_updated_at  TEXT,
+                locg_id         INTEGER,
+                locg_variant_id INTEGER,
+                created_at      TEXT DEFAULT (datetime('now')),
+                UNIQUE(title, issue, year, grade)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bid_comics (
+                bid_id     INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+                comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (bid_id, comic_id)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bid_comics_bid ON bid_comics(bid_id)"
+        )
+        conn.execute("""
+            INSERT OR IGNORE INTO bid_comics (bid_id, comic_id, is_primary)
+            SELECT id, comic_id, 1 FROM bids WHERE comic_id IS NOT NULL
+        """)
+
+    mod.register_db_tables = register_db_tables
+    return mod
 
 
 def _make_mock_gixen():
@@ -20,6 +86,7 @@ def _make_mock_gixen():
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
+    _install_plugins(monkeypatch, {"comic-stub": _make_comic_schema_plugin()})
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("GIXEN_USERNAME", "testuser")
     monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
