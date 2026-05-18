@@ -75,6 +75,12 @@ class GixenPluginSpec:
 
         DDL executed in this hook is wrapped in a SQLite savepoint by the
         host; a failure rolls back this plugin's DDL only.
+
+        **Important:** call ``conn.execute(...)`` per statement, NOT
+        ``conn.executescript(...)``. Python's sqlite3 ``executescript``
+        implicitly commits any pending transaction before running, which
+        releases the host's savepoint and breaks per-plugin isolation. If
+        you need multiple statements, call ``conn.execute`` for each one.
         """
 
     @hookspec

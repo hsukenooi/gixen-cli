@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
+from gixen.plugins import load_plugins
 from server.db import (
     DB_PATH, init_db, upsert_comic, list_comics, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
@@ -558,6 +559,56 @@ async def lifespan(app: FastAPI):
     _api_lock = asyncio.Lock()
     _sync_lock = asyncio.Lock()
     _ebay_fallback_lock = asyncio.Lock()
+
+    # ----- Plugin loading -----
+    # Discover and register external plugins, then fire startup hooks. Per-plugin
+    # isolation is reserved for register_db_tables (DDL warrants savepoint
+    # rollback); routes and tabs use bulk pm.hook calls. One bad plugin's hook
+    # raising halts the chain — that's intentional, so the failure is loud and
+    # the operator sees it in logs.
+    pm = load_plugins()
+    app.state.plugin_manager = pm
+
+    # Tables first: plugin routes may query plugin tables. Each plugin's DDL
+    # runs inside its own SQLite savepoint; failure rolls back this plugin
+    # only, leaves the connection usable for the next plugin and for core.
+    for plugin_name, _plugin in pm.list_name_plugin():
+        sp_name = "sp_" + re.sub(r"[^a-z0-9_]", "_", plugin_name.lower())
+        try:
+            _db.execute(f"SAVEPOINT {sp_name}")
+            others = [p for n, p in pm.list_name_plugin() if n != plugin_name]
+            pm.subset_hook_caller(
+                "register_db_tables", remove_plugins=others
+            )(conn=_db)
+            _db.execute(f"RELEASE {sp_name}")
+        except Exception:
+            _db.execute(f"ROLLBACK TO {sp_name}")
+            _db.execute(f"RELEASE {sp_name}")
+            logger.exception(
+                "register_db_tables failed for plugin %s", plugin_name
+            )
+
+    # Routes — bulk call.
+    try:
+        pm.hook.register_routes(app=app)
+    except Exception:
+        logger.exception(
+            "register_routes failed; some plugin routes may be missing"
+        )
+
+    # Dashboard tabs — bulk call, flatten the list-of-lists.
+    try:
+        tab_lists = pm.hook.register_dashboard_tabs()
+        app.state.dashboard_tabs = [t for lst in tab_lists for t in (lst or [])]
+    except Exception:
+        logger.exception(
+            "register_dashboard_tabs failed; tab list may be incomplete"
+        )
+        app.state.dashboard_tabs = []
+
+    # Force OpenAPI schema regeneration so plugin routes show up in /docs.
+    app.openapi_schema = None
+    # ----- /Plugin loading -----
 
     sync_task = None
     sniper_task = None
