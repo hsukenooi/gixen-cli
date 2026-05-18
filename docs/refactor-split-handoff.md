@@ -46,7 +46,7 @@ Anything in this list must move out to `comic-pipeline/plugins/gixen-overlay/` d
     - `GET /api/history` (server/main.py:924) — same join, same columns
     - `GET /api/bids` (server/main.py:987) — same join, same columns
     - `POST /api/bids` (`api_add_bid`, server/main.py:781-826) — inline `upsert_comic` call at lines 785–800
-    - `PUT /api/bids/{item_id}` (`api_edit_bid`, server/main.py:1026-1082) — comic-specific UPDATE block at lines 1051–1063
+    - `PATCH /api/bids/{item_id}` (`api_edit_bid`, server/main.py:1026-1082) — comic-specific UPDATE block at lines 1051–1063
   - **Pydantic models — three are contaminated:**
     - `UpsertComicRequest` (server/main.py:606–624) — fully comic-specific, moves whole.
     - `LocgLinkRequest` (server/main.py:693–696) — fully comic-specific, moves whole.
