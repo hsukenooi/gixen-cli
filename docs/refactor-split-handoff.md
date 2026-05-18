@@ -34,7 +34,7 @@ Anything in this list must move out to `comic-pipeline/plugins/gixen-overlay/` d
 ### Backend (`server/`)
 
 - **`server/title_parser.py`** (347 lines) — entirely comic-specific. Parses series/issue/year/grade from eBay titles. Move whole file.
-- **`server/db.py`** — tables `comics` and `bid_comics` are comic-specific (columns: `title`, `issue`, `year`, `grade`, `fmv_low`, `fmv_high`, `fmv_comps`, `fmv_confidence`, `fmv_notes`, `fmv_updated_at`, `locg_id`, `locg_variant_id`). The generic `bids` table stays. Schema-creation code for the comic tables moves to the plugin. **Cross-plugin FK:** `bids.comic_id INTEGER REFERENCES comics(id)` (server/db.py:31) — core's `bids` currently has a foreign key into the (soon-to-be-plugin) `comics` table. PER-27 must drop the `REFERENCES comics(id)` declaration and treat `comic_id` as an untyped int link the plugin interprets.
+- **`server/db.py`** — tables `comics` and `bid_comics` are comic-specific (columns: `title`, `issue`, `year`, `grade`, `fmv_low`, `fmv_high`, `fmv_comps`, `fmv_confidence`, `fmv_notes`, `fmv_updated_at`, `locg_id`, `locg_variant_id`). The generic `bids` table stays. Schema-creation code for the comic tables moves to the plugin. **Cross-plugin FK:** ~~`bids.comic_id INTEGER REFERENCES comics(id)` (server/db.py:31)~~ — removed by PER-27; `comic_id` is now an untyped int the plugin interprets. Existing DBs are migrated via `_apply_migrations` (table-rebuild dance).
 - **`server/main.py`** — 5 dedicated comic routes, plus 3 "generic" routes that are comic-contaminated:
   - **Dedicated (move with plugin):**
     - `GET /v2/comics` (page render)

@@ -15,6 +15,36 @@ from server.db import (
 )
 
 
+_COMICS_DDL = """
+    CREATE TABLE IF NOT EXISTS comics (
+        id              INTEGER PRIMARY KEY,
+        title           TEXT NOT NULL,
+        issue           TEXT NOT NULL,
+        year            INTEGER NOT NULL,
+        grade           REAL,
+        fmv_low         REAL,
+        fmv_high        REAL,
+        fmv_comps       INTEGER,
+        fmv_confidence  TEXT CHECK(fmv_confidence IN ('high', 'medium', 'low') OR fmv_confidence IS NULL),
+        fmv_notes       TEXT,
+        fmv_updated_at  TEXT,
+        locg_id         INTEGER,
+        locg_variant_id INTEGER,
+        created_at      TEXT DEFAULT (datetime('now')),
+        UNIQUE(title, issue, year, grade)
+    )
+"""
+
+_BID_COMICS_DDL = """
+    CREATE TABLE IF NOT EXISTS bid_comics (
+        bid_id     INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+        comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bid_id, comic_id)
+    )
+"""
+
+
 @pytest.fixture
 def db(tmp_path):
     conn = init_db(tmp_path / "test.db")
@@ -22,12 +52,35 @@ def db(tmp_path):
     conn.close()
 
 
+@pytest.fixture
+def db_with_comics(tmp_path):
+    """init_db + comics and bid_comics tables for tests that call comic functions.
+
+    After PER-27, init_db no longer creates these tables — they are plugin-owned.
+    Tests that exercise upsert_comic, link_comic_to_bid, etc. use this fixture
+    instead of db so they don't depend on core creating the tables.
+    """
+    conn = init_db(tmp_path / "test.db")
+    conn.execute(_COMICS_DDL)
+    conn.execute(_BID_COMICS_DDL)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_comics_bid ON bid_comics(bid_id)")
+    conn.commit()
+    yield conn
+    conn.close()
+
+
 def test_init_creates_tables(db):
     cur = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = {row[0] for row in cur}
-    assert "comics" in tables
     assert "bids" in tables
-    assert "bid_comics" in tables
+    assert "comics" not in tables
+    assert "bid_comics" not in tables
+
+
+def test_bids_comic_id_has_no_foreign_key(db):
+    """Fresh init_db creates bids.comic_id with no FK declaration."""
+    fk_rows = db.execute("PRAGMA foreign_key_list(bids)").fetchall()
+    assert len(fk_rows) == 0
 
 
 def test_wal_mode_enabled(db):
@@ -35,28 +88,28 @@ def test_wal_mode_enabled(db):
     assert row[0] == "wal"
 
 
-def test_upsert_comic_inserts(db):
-    comic_id = upsert_comic(db, title="Amazing Spider-Man", issue="300",
+def test_upsert_comic_inserts(db_with_comics):
+    comic_id = upsert_comic(db_with_comics, title="Amazing Spider-Man", issue="300",
                             year=1988, grade=9.2,
                             fmv_low=800.0, fmv_high=1000.0,
                             fmv_comps=12, fmv_confidence="high",
                             fmv_notes="Key issue")
     assert isinstance(comic_id, int)
-    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
+    row = db_with_comics.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     assert row["title"] == "Amazing Spider-Man"
     assert row["grade"] == 9.2
     assert row["fmv_confidence"] == "high"
 
 
-def test_upsert_comic_updates_on_conflict(db):
-    id1 = upsert_comic(db, title="X-Men", issue="1", year=1963, grade=8.0,
+def test_upsert_comic_updates_on_conflict(db_with_comics):
+    id1 = upsert_comic(db_with_comics, title="X-Men", issue="1", year=1963, grade=8.0,
                        fmv_low=500.0, fmv_high=700.0,
                        fmv_comps=5, fmv_confidence="medium", fmv_notes="")
-    id2 = upsert_comic(db, title="X-Men", issue="1", year=1963, grade=8.0,
+    id2 = upsert_comic(db_with_comics, title="X-Men", issue="1", year=1963, grade=8.0,
                        fmv_low=550.0, fmv_high=750.0,
                        fmv_comps=8, fmv_confidence="high", fmv_notes="Updated")
     assert id1 == id2
-    row = db.execute("SELECT fmv_low FROM comics WHERE id=?", (id1,)).fetchone()
+    row = db_with_comics.execute("SELECT fmv_low FROM comics WHERE id=?", (id1,)).fetchone()
     assert row["fmv_low"] == 550.0
 
 
@@ -71,11 +124,11 @@ def test_insert_bid(db):
     assert row["max_bid"] == 800.0
 
 
-def test_insert_bid_links_comic(db):
-    comic_id = upsert_comic(db, "Hulk", "181", 1974, 9.0,
+def test_insert_bid_links_comic(db_with_comics):
+    comic_id = upsert_comic(db_with_comics, "Hulk", "181", 1974, 9.0,
                             50.0, 70.0, 10, "high", "")
-    bid_id = insert_bid(db, "987654321", 60.0, comic_id, 6, 0, "seller2")
-    row = db.execute("SELECT comic_id FROM bids WHERE id=?", (bid_id,)).fetchone()
+    bid_id = insert_bid(db_with_comics, "987654321", 60.0, comic_id, 6, 0, "seller2")
+    row = db_with_comics.execute("SELECT comic_id FROM bids WHERE id=?", (bid_id,)).fetchone()
     assert row["comic_id"] == comic_id
 
 
@@ -167,67 +220,67 @@ def test_update_bid_noop_on_non_pending(db):
     assert row["max_bid"] == 50.0  # unchanged — update_bid guards on status='PENDING'
 
 
-def test_upsert_comic_persists_locg_ids(db):
+def test_upsert_comic_persists_locg_ids(db_with_comics):
     """locg_id and locg_variant_id round-trip through upsert_comic."""
     comic_id = upsert_comic(
-        db, title="Amazing Spider-Man", issue="300", year=1988, grade=9.2,
+        db_with_comics, title="Amazing Spider-Man", issue="300", year=1988, grade=9.2,
         fmv_low=800.0, fmv_high=1000.0,
         fmv_comps=12, fmv_confidence="high", fmv_notes="",
         locg_id=6977652, locg_variant_id=6977652,
     )
-    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
+    row = db_with_comics.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     assert row["locg_id"] == 6977652
     assert row["locg_variant_id"] == 6977652
 
 
-def test_upsert_comic_locg_ids_default_to_null(db):
+def test_upsert_comic_locg_ids_default_to_null(db_with_comics):
     """Backwards compat: existing call sites without locg_id keep working."""
     comic_id = upsert_comic(
-        db, title="Hulk", issue="181", year=1974, grade=9.0,
+        db_with_comics, title="Hulk", issue="181", year=1974, grade=9.0,
         fmv_low=50.0, fmv_high=70.0,
         fmv_comps=10, fmv_confidence="high", fmv_notes="",
     )
-    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
+    row = db_with_comics.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     assert row["locg_id"] is None
     assert row["locg_variant_id"] is None
 
 
-def test_upsert_comic_locg_ids_preserved_on_conflict(db):
+def test_upsert_comic_locg_ids_preserved_on_conflict(db_with_comics):
     """A second upsert without locg_id must not clobber the existing values."""
     id1 = upsert_comic(
-        db, title="X-Men", issue="1", year=1963, grade=8.0,
+        db_with_comics, title="X-Men", issue="1", year=1963, grade=8.0,
         fmv_low=500.0, fmv_high=700.0,
         fmv_comps=5, fmv_confidence="medium", fmv_notes="",
         locg_id=12345, locg_variant_id=67890,
     )
     id2 = upsert_comic(
-        db, title="X-Men", issue="1", year=1963, grade=8.0,
+        db_with_comics, title="X-Men", issue="1", year=1963, grade=8.0,
         fmv_low=550.0, fmv_high=750.0,
         fmv_comps=8, fmv_confidence="high", fmv_notes="Updated",
         # No locg_id passed — should preserve prior values
     )
     assert id1 == id2
-    row = db.execute("SELECT * FROM comics WHERE id=?", (id1,)).fetchone()
+    row = db_with_comics.execute("SELECT * FROM comics WHERE id=?", (id1,)).fetchone()
     assert row["locg_id"] == 12345
     assert row["locg_variant_id"] == 67890
 
 
-def test_upsert_comic_locg_ids_updated_when_provided(db):
+def test_upsert_comic_locg_ids_updated_when_provided(db_with_comics):
     """A second upsert with new locg_id values should overwrite the stored ones."""
     id1 = upsert_comic(
-        db, title="Spawn", issue="1", year=1992, grade=9.8,
+        db_with_comics, title="Spawn", issue="1", year=1992, grade=9.8,
         fmv_low=100.0, fmv_high=150.0,
         fmv_comps=5, fmv_confidence="high", fmv_notes="",
         locg_id=100, locg_variant_id=None,
     )
     id2 = upsert_comic(
-        db, title="Spawn", issue="1", year=1992, grade=9.8,
+        db_with_comics, title="Spawn", issue="1", year=1992, grade=9.8,
         fmv_low=110.0, fmv_high=160.0,
         fmv_comps=6, fmv_confidence="high", fmv_notes="",
         locg_id=200, locg_variant_id=300,
     )
     assert id1 == id2
-    row = db.execute("SELECT * FROM comics WHERE id=?", (id1,)).fetchone()
+    row = db_with_comics.execute("SELECT * FROM comics WHERE id=?", (id1,)).fetchone()
     assert row["locg_id"] == 200
     assert row["locg_variant_id"] == 300
 
@@ -236,21 +289,21 @@ def test_upsert_comic_locg_ids_updated_when_provided(db):
 # bid_comics junction table
 # ---------------------------------------------------------------------------
 
-def _make_lot(db, item_id="900000001", n=3, series="Daredevil: The Man Without Fear"):
+def _make_lot(db_with_comics, item_id="900000001", n=3, series="Daredevil: The Man Without Fear"):
     """Helper: insert a bid + N comics, return (bid_id, [comic_id, ...])."""
-    bid_id = insert_bid(db, item_id, 100.0, None, 6, 0, "s")
+    bid_id = insert_bid(db_with_comics, item_id, 100.0, None, 6, 0, "s")
     comic_ids = [
-        upsert_comic(db, series, str(i), 1993, None,
+        upsert_comic(db_with_comics, series, str(i), 1993, None,
                      None, None, None, None, None)
         for i in range(1, n + 1)
     ]
     return bid_id, comic_ids
 
 
-def test_link_comic_to_bid_basic(db):
-    bid_id, comic_ids = _make_lot(db, n=2)
-    link_comic_to_bid(db, bid_id, comic_ids[0])
-    rows = db.execute(
+def test_link_comic_to_bid_basic(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=2)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0])
+    rows = db_with_comics.execute(
         "SELECT * FROM bid_comics WHERE bid_id=?", (bid_id,)
     ).fetchall()
     assert len(rows) == 1
@@ -258,21 +311,21 @@ def test_link_comic_to_bid_basic(db):
     assert rows[0]["is_primary"] == 0
 
 
-def test_link_comic_to_bid_idempotent(db):
-    bid_id, comic_ids = _make_lot(db, n=1)
-    link_comic_to_bid(db, bid_id, comic_ids[0])
-    link_comic_to_bid(db, bid_id, comic_ids[0])
-    rows = db.execute(
+def test_link_comic_to_bid_idempotent(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=1)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0])
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0])
+    rows = db_with_comics.execute(
         "SELECT COUNT(*) AS n FROM bid_comics WHERE bid_id=?", (bid_id,)
     ).fetchone()
     assert rows["n"] == 1
 
 
-def test_link_comic_to_bid_primary_demotes_prior(db):
-    bid_id, comic_ids = _make_lot(db, n=3)
-    link_comic_to_bid(db, bid_id, comic_ids[0], is_primary=True)
-    link_comic_to_bid(db, bid_id, comic_ids[1], is_primary=True)
-    rows = db.execute(
+def test_link_comic_to_bid_primary_demotes_prior(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=3)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0], is_primary=True)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[1], is_primary=True)
+    rows = db_with_comics.execute(
         "SELECT comic_id, is_primary FROM bid_comics WHERE bid_id=? ORDER BY comic_id",
         (bid_id,),
     ).fetchall()
@@ -281,32 +334,32 @@ def test_link_comic_to_bid_primary_demotes_prior(db):
     assert by_comic[comic_ids[1]] == 1
 
 
-def test_link_comic_to_bid_primary_mirrors_to_bids(db):
-    bid_id, comic_ids = _make_lot(db, n=2)
-    link_comic_to_bid(db, bid_id, comic_ids[0], is_primary=True)
-    row = db.execute("SELECT comic_id FROM bids WHERE id=?", (bid_id,)).fetchone()
+def test_link_comic_to_bid_primary_mirrors_to_bids(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=2)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0], is_primary=True)
+    row = db_with_comics.execute("SELECT comic_id FROM bids WHERE id=?", (bid_id,)).fetchone()
     assert row["comic_id"] == comic_ids[0]
 
 
-def test_link_comic_to_bid_promotes_existing_row(db):
+def test_link_comic_to_bid_promotes_existing_row(db_with_comics):
     """Calling with is_primary=True on an already-linked non-primary row promotes it."""
-    bid_id, comic_ids = _make_lot(db, n=2)
-    link_comic_to_bid(db, bid_id, comic_ids[0])  # non-primary
-    link_comic_to_bid(db, bid_id, comic_ids[0], is_primary=True)
-    row = db.execute(
+    bid_id, comic_ids = _make_lot(db_with_comics, n=2)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0])  # non-primary
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0], is_primary=True)
+    row = db_with_comics.execute(
         "SELECT is_primary FROM bid_comics WHERE bid_id=? AND comic_id=?",
         (bid_id, comic_ids[0]),
     ).fetchone()
     assert row["is_primary"] == 1
 
 
-def test_get_comics_for_bid_orders_primary_first(db):
-    bid_id, comic_ids = _make_lot(db, n=3)
+def test_get_comics_for_bid_orders_primary_first(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=3)
     # Link in reverse to verify primary-first ordering, not insertion order
-    link_comic_to_bid(db, bid_id, comic_ids[2])
-    link_comic_to_bid(db, bid_id, comic_ids[1])
-    link_comic_to_bid(db, bid_id, comic_ids[0], is_primary=True)
-    rows = get_comics_for_bid(db, bid_id)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[2])
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[1])
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0], is_primary=True)
+    rows = get_comics_for_bid(db_with_comics, bid_id)
     assert len(rows) == 3
     assert rows[0]["id"] == comic_ids[0]
     assert rows[0]["is_primary"] == 1
@@ -315,71 +368,91 @@ def test_get_comics_for_bid_orders_primary_first(db):
     assert rows[2]["issue"] == "3"
 
 
-def test_get_comics_for_bid_empty(db):
-    bid_id = insert_bid(db, "900000099", 50.0, None, 6, 0, "s")
-    assert get_comics_for_bid(db, bid_id) == []
+def test_get_comics_for_bid_empty(db_with_comics):
+    bid_id = insert_bid(db_with_comics, "900000099", 50.0, None, 6, 0, "s")
+    assert get_comics_for_bid(db_with_comics, bid_id) == []
 
 
-def test_get_primary_comic_for_bid_returns_primary(db):
-    bid_id, comic_ids = _make_lot(db, n=2)
-    link_comic_to_bid(db, bid_id, comic_ids[0], is_primary=True)
-    link_comic_to_bid(db, bid_id, comic_ids[1])
-    row = get_primary_comic_for_bid(db, bid_id)
+def test_get_primary_comic_for_bid_returns_primary(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=2)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0], is_primary=True)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[1])
+    row = get_primary_comic_for_bid(db_with_comics, bid_id)
     assert row is not None
     assert row["id"] == comic_ids[0]
 
 
-def test_get_primary_comic_for_bid_none_when_only_secondary(db):
-    bid_id, comic_ids = _make_lot(db, n=1)
-    link_comic_to_bid(db, bid_id, comic_ids[0])  # not primary
-    assert get_primary_comic_for_bid(db, bid_id) is None
+def test_get_primary_comic_for_bid_none_when_only_secondary(db_with_comics):
+    bid_id, comic_ids = _make_lot(db_with_comics, n=1)
+    link_comic_to_bid(db_with_comics, bid_id, comic_ids[0])  # not primary
+    assert get_primary_comic_for_bid(db_with_comics, bid_id) is None
 
 
-def test_migration_backfills_bid_comics_from_legacy_bids(tmp_path):
-    """Pre-existing bids with bids.comic_id should populate bid_comics on init.
+# ---------------------------------------------------------------------------
+# FK-removal migration
+# ---------------------------------------------------------------------------
 
-    Simulates the upgrade path: an old DB already has bids.comic_id values; the
-    new code creates bid_comics + backfills via INSERT OR IGNORE.
-    """
-    db_path = tmp_path / "upgrade.db"
-    # First init: create the schema (under the new code, that's everything).
+def test_fk_removal_migration_drops_comics_reference(tmp_path):
+    """On a legacy DB with bids.comic_id REFERENCES comics(id), init_db removes
+    the FK. Existing bids rows survive the table rebuild intact."""
+    legacy_db_path = tmp_path / "legacy.db"
+
+    # Build a minimal legacy DB with the old bids schema (FK present) + comics.
+    raw = sqlite3.connect(str(legacy_db_path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            issue TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            grade REAL
+        );
+        CREATE TABLE bids (
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            comic_id INTEGER REFERENCES comics(id),
+            max_bid REAL NOT NULL,
+            bid_offset INTEGER DEFAULT 6,
+            snipe_group INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'PENDING',
+            winning_bid REAL,
+            seller TEXT,
+            auction_end_at TEXT,
+            local_snipe_at TEXT,
+            local_snipe_result TEXT,
+            notes TEXT,
+            added_at TEXT DEFAULT (datetime('now')),
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+    """)
+    raw.execute("INSERT INTO comics (title, issue, year) VALUES ('Hulk', '181', 1974)")
+    raw.execute("INSERT INTO bids (item_id, max_bid, comic_id) VALUES ('legacy001', 50.0, 1)")
+    raw.commit()
+    raw.close()
+
+    conn = init_db(legacy_db_path)
+    try:
+        fk_after = conn.execute("PRAGMA foreign_key_list(bids)").fetchall()
+        assert not any(row["table"] == "comics" for row in fk_after)
+        row = conn.execute(
+            "SELECT item_id, max_bid, comic_id FROM bids WHERE item_id='legacy001'"
+        ).fetchone()
+        assert row is not None
+        assert row["max_bid"] == 50.0
+        assert row["comic_id"] == 1
+    finally:
+        conn.close()
+
+
+def test_fk_removal_migration_is_idempotent(tmp_path):
+    """Calling init_db twice on a DB that already has no FK is a no-op."""
+    db_path = tmp_path / "nofk.db"
     conn = init_db(db_path)
-    comic_id = upsert_comic(conn, "Hulk", "181", 1974, 9.0,
-                            50.0, 70.0, 10, "high", "")
-    # Insert a bid that already has comic_id set, then wipe the junction
-    # to simulate a DB created before bid_comics existed.
-    bid_id = insert_bid(conn, "999000001", 60.0, comic_id, 6, 0, "s")
-    conn.execute("DELETE FROM bid_comics")
-    conn.commit()
+    assert len(conn.execute("PRAGMA foreign_key_list(bids)").fetchall()) == 0
     conn.close()
 
-    # Second init: should re-run migrations, which backfill bid_comics.
     conn2 = init_db(db_path)
-    rows = conn2.execute(
-        "SELECT bid_id, comic_id, is_primary FROM bid_comics WHERE bid_id=?",
-        (bid_id,),
-    ).fetchall()
+    assert len(conn2.execute("PRAGMA foreign_key_list(bids)").fetchall()) == 0
     conn2.close()
-    assert len(rows) == 1
-    assert rows[0]["comic_id"] == comic_id
-    assert rows[0]["is_primary"] == 1
-
-
-def test_migration_backfill_is_idempotent(tmp_path):
-    """Running init_db a second time on a fresh DB doesn't duplicate junction rows."""
-    db_path = tmp_path / "idem.db"
-    conn = init_db(db_path)
-    comic_id = upsert_comic(conn, "Hulk", "181", 1974, 9.0,
-                            50.0, 70.0, 10, "high", "")
-    bid_id = insert_bid(conn, "999000002", 60.0, comic_id, 6, 0, "s")
-    # Drop+recreate junction wouldn't happen in real life, but the backfill
-    # should still be safe to run after the row already exists.
-    conn.close()
-
-    # Re-open: backfill runs again. Existing row should not be duplicated.
-    conn2 = init_db(db_path)
-    rows = conn2.execute(
-        "SELECT COUNT(*) AS n FROM bid_comics WHERE bid_id=?", (bid_id,)
-    ).fetchone()
-    conn2.close()
-    assert rows["n"] == 1
