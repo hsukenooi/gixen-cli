@@ -191,23 +191,28 @@ const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
 // ---- plugin tab injection --------------------------------------------------
 // Fetches /api/dashboard-tabs at page load and inserts plugin-contributed
 // <a> elements into the topbar nav, after the hardcoded core tabs.
+// .topbar and .spacer are present above this <script> tag in source order.
 (function injectPluginTabs() {
-  fetch("/api/dashboard-tabs")
-    .then(r => r.ok ? r.json() : [])
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  fetch("/api/dashboard-tabs", { signal: controller.signal })
+    .then(r => { clearTimeout(timeout); return r.ok ? r.json() : []; })
     .then(tabs => {
       const topbar = document.querySelector(".topbar");
       if (!topbar || !tabs.length) return;
-      // Insert after the last core nav link (bids) and before the spacer.
+      // insertBefore(a, null) falls back to appendChild if .spacer is missing.
       const spacer = topbar.querySelector(".spacer");
       for (const tab of tabs) {
+        if (!tab.path || !tab.path.startsWith("/")) continue;
         const a = document.createElement("a");
         a.className = "seg nav";
+        if (location.pathname === tab.path) a.classList.add("active");
         a.href = tab.path;
         a.textContent = tab.label;
         topbar.insertBefore(a, spacer);
       }
     })
-    .catch(() => {});
+    .catch(err => { if (err.name !== "AbortError") console.warn("[injectPluginTabs]", err); });
 })();
 
 // ---- demo fixture (used only when ?demo=1) ---------------------------------

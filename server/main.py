@@ -746,7 +746,7 @@ async def health():
 
 @app.get("/api/dashboard-tabs")
 def api_dashboard_tabs(request: Request) -> list[dict]:
-    return request.app.state.dashboard_tabs
+    return getattr(request.app.state, "dashboard_tabs", [])
 
 
 @app.post("/api/bids")

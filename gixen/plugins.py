@@ -292,7 +292,15 @@ def _collect_dashboard_tabs(
                     type(lst).__name__,
                 )
                 continue
-            flat.extend(lst)
+            valid = [item for item in lst if isinstance(item, dict)]
+            dropped = len(lst) - len(valid)
+            if dropped:
+                logger.error(
+                    "register_dashboard_tabs: %d non-dict element(s) dropped from "
+                    "plugin contribution; expected list[dict] elements",
+                    dropped,
+                )
+            flat.extend(valid)
         return flat
     except Exception:
         logger.exception(

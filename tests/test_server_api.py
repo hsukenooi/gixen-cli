@@ -1024,6 +1024,8 @@ def test_api_dashboard_tabs_returns_plugin_tabs(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "tabs.db"))
     monkeypatch.setenv("GIXEN_USERNAME", "u")
     monkeypatch.setenv("GIXEN_PASSWORD", "p")
+    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
     mock = _make_mock_gixen()
     with patch("server.main.GixenClient", return_value=mock):
         from server.main import app
@@ -1045,6 +1047,8 @@ def test_api_dashboard_tabs_empty_without_plugins(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "empty.db"))
     monkeypatch.setenv("GIXEN_USERNAME", "u")
     monkeypatch.setenv("GIXEN_PASSWORD", "p")
+    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
     mock = _make_mock_gixen()
     with patch("server.main.GixenClient", return_value=mock):
         from server.main import app

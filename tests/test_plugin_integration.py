@@ -307,16 +307,14 @@ def test_plugin_dashboard_tabs_collected(make_app, monkeypatch):
 
     @hookimpl
     def register_dashboard_tabs():
-        return [{"slug": "fake", "label": "Fake", "key": "f", "route": "/v2/fake"}]
+        return [{"label": "Fake", "path": "/v2/fake"}]
 
     mod.register_dashboard_tabs = register_dashboard_tabs
     _install_plugins(monkeypatch, {"tabplug": mod})
 
     with make_app() as client:
         tabs = client.app.state.dashboard_tabs
-        assert tabs == [
-            {"slug": "fake", "label": "Fake", "key": "f", "route": "/v2/fake"}
-        ]
+        assert tabs == [{"label": "Fake", "path": "/v2/fake"}]
 
 
 # --- Error paths in the lifespan -----------------------------------------------
