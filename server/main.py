@@ -313,7 +313,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             except (ValueError, TypeError):
                 max_bid = 0.0
             insert_bid(
-                db, snipe["item_id"], max_bid, None,
+                db, snipe["item_id"], max_bid,
                 int(snipe.get("bid_offset", 6)),
                 int(snipe.get("snipe_group", 0)),
                 snipe.get("seller"),
@@ -760,7 +760,6 @@ async def api_add_bid(req: AddBidRequest):
         db,
         item_id=req.item_id,
         max_bid=req.max_bid,
-        comic_id=None,
         bid_offset=req.bid_offset,
         snipe_group=req.snipe_group,
         seller=None,
@@ -793,7 +792,7 @@ async def api_get_snipes():
         end_date_iso = item.get("auction_end_at")
         result.append({
             "item_id": item["item_id"],
-            "title": item.get("ebay_title") or "",
+            "title": item.get("ebay_title") or None,
             "current_bid": item.get("cached_current_bid"),
             "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
@@ -805,7 +804,6 @@ async def api_get_snipes():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "cached_at": item.get("cached_at"),
-            "comic_id": item.get("comic_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })
@@ -839,7 +837,7 @@ async def api_get_history():
         end_date_iso = item.get("auction_end_at")
         result.append({
             "item_id": item["item_id"],
-            "title": item.get("ebay_title") or "",
+            "title": item.get("ebay_title") or None,
             "current_bid": item.get("cached_current_bid"),
             "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
@@ -851,7 +849,6 @@ async def api_get_history():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "cached_at": item.get("cached_at"),
-            "comic_id": item.get("comic_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })
@@ -872,7 +869,7 @@ async def api_get_all_bids():
         item = dict(row)
         result.append({
             "item_id": item["item_id"],
-            "title": item.get("ebay_title") or "",
+            "title": item.get("ebay_title") or None,
             "max_bid": item["max_bid"],
             "bid_offset": item["bid_offset"],
             "snipe_group": item["snipe_group"],
@@ -882,7 +879,6 @@ async def api_get_all_bids():
             "status_mirror": item.get("status_mirror"),
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
-            "comic_id": item.get("comic_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })

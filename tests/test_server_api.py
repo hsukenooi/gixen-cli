@@ -295,7 +295,7 @@ def test_cache_gixen_data_coalesces_none_inputs(tmp_path):
     from server.db import init_db, insert_bid, cache_gixen_data, get_bid_by_item_id
 
     db = init_db(tmp_path / "coalesce.db")
-    insert_bid(db, "111111", 50.0, None, 6, 0, "original_seller")
+    insert_bid(db, "111111", 50.0, 6, 0, "original_seller")
     cache_gixen_data(db, "111111", "First Title", None, "10.00 USD")
     db.commit()
     row = get_bid_by_item_id(db, "111111")

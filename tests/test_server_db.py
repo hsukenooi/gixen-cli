@@ -42,7 +42,7 @@ def test_wal_mode_enabled(db):
 
 def test_insert_bid(db):
     bid_id = insert_bid(db, item_id="123456789", max_bid=800.0,
-                        comic_id=None, bid_offset=6, snipe_group=0,
+                        bid_offset=6, snipe_group=0,
                         seller="seller1")
     assert isinstance(bid_id, int)
     row = db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
@@ -52,7 +52,7 @@ def test_insert_bid(db):
 
 
 def test_get_bid_by_item_id(db):
-    insert_bid(db, "111222333", 50.0, None, 6, 0, "s")
+    insert_bid(db, "111222333", 50.0, 6, 0, "s")
     row = get_bid_by_item_id(db, "111222333")
     assert row is not None
     assert row["item_id"] == "111222333"
@@ -63,7 +63,7 @@ def test_get_bid_by_item_id_missing(db):
 
 
 def test_update_bid(db):
-    insert_bid(db, "444555666", 50.0, None, 6, 0, "s")
+    insert_bid(db, "444555666", 50.0, 6, 0, "s")
     update_bid(db, "444555666", max_bid=60.0, bid_offset=10, snipe_group=1)
     row = get_bid_by_item_id(db, "444555666")
     assert row["max_bid"] == 60.0
@@ -71,7 +71,7 @@ def test_update_bid(db):
 
 
 def test_update_bid_status(db):
-    insert_bid(db, "777888999", 100.0, None, 6, 0, "s")
+    insert_bid(db, "777888999", 100.0, 6, 0, "s")
     update_bid_status(db, "777888999", status="WON",
                       winning_bid=85.0, resolved_at="2026-04-25T12:00:00")
     row = get_bid_by_item_id(db, "777888999")
@@ -81,14 +81,14 @@ def test_update_bid_status(db):
 
 
 def test_delete_bid_marks_purged(db):
-    insert_bid(db, "555444333", 30.0, None, 6, 0, "s")
+    insert_bid(db, "555444333", 30.0, 6, 0, "s")
     delete_bid(db, "555444333")
     row = get_bid_by_item_id(db, "555444333")
     assert row["status"] == "PURGED"
 
 
 def test_delete_bid_marks_won_bid_purged(db):
-    insert_bid(db, "666777888", 50.0, None, 6, 0, "s")
+    insert_bid(db, "666777888", 50.0, 6, 0, "s")
     update_bid_status(db, "666777888", status="WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
     delete_bid(db, "666777888")
     row = get_bid_by_item_id(db, "666777888")
@@ -96,8 +96,8 @@ def test_delete_bid_marks_won_bid_purged(db):
 
 
 def test_get_all_bids_returns_list(db):
-    insert_bid(db, "100000001", 10.0, None, 6, 0, "s")
-    insert_bid(db, "100000002", 20.0, None, 6, 0, "s")
+    insert_bid(db, "100000001", 10.0, 6, 0, "s")
+    insert_bid(db, "100000002", 20.0, 6, 0, "s")
     rows = get_all_bids(db)
     item_ids = [r["item_id"] for r in rows]
     assert "100000001" in item_ids
@@ -105,8 +105,8 @@ def test_get_all_bids_returns_list(db):
 
 
 def test_mark_bids_purged_sets_status(db):
-    insert_bid(db, "200000001", 50.0, None, 6, 0, "s")
-    insert_bid(db, "200000002", 60.0, None, 6, 0, "s")
+    insert_bid(db, "200000001", 50.0, 6, 0, "s")
+    insert_bid(db, "200000002", 60.0, 6, 0, "s")
     mark_bids_purged(db, ["200000001", "200000002"])
     row1 = get_bid_by_item_id(db, "200000001")
     row2 = get_bid_by_item_id(db, "200000002")
@@ -116,7 +116,7 @@ def test_mark_bids_purged_sets_status(db):
 
 
 def test_mark_bids_purged_transitions_won_bid(db):
-    insert_bid(db, "200000003", 50.0, None, 6, 0, "s")
+    insert_bid(db, "200000003", 50.0, 6, 0, "s")
     update_bid_status(db, "200000003", "WON", winning_bid=42.0, resolved_at="2026-04-25T10:00:00")
     mark_bids_purged(db, ["200000003"])
     row = get_bid_by_item_id(db, "200000003")
@@ -125,14 +125,14 @@ def test_mark_bids_purged_transitions_won_bid(db):
 
 
 def test_mark_bids_purged_empty_list_is_noop(db):
-    insert_bid(db, "200000004", 50.0, None, 6, 0, "s")
+    insert_bid(db, "200000004", 50.0, 6, 0, "s")
     mark_bids_purged(db, [])
     row = get_bid_by_item_id(db, "200000004")
     assert row["status"] == "PENDING"
 
 
 def test_update_bid_noop_on_non_pending(db):
-    insert_bid(db, "300000001", 50.0, None, 6, 0, "s")
+    insert_bid(db, "300000001", 50.0, 6, 0, "s")
     update_bid_status(db, "300000001", "WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
     update_bid(db, "300000001", max_bid=999.0, bid_offset=6, snipe_group=0)
     row = get_bid_by_item_id(db, "300000001")

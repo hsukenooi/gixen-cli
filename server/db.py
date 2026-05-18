@@ -135,17 +135,16 @@ def insert_bid(
     conn: sqlite3.Connection,
     item_id: str,
     max_bid: float,
-    comic_id: int | None,
     bid_offset: int,
     snipe_group: int,
     seller: str | None,
 ) -> int:
     cur = conn.execute(
         """
-        INSERT INTO bids (item_id, max_bid, comic_id, bid_offset, snipe_group, seller)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (item_id, max_bid, comic_id, bid_offset, snipe_group, seller),
+        (item_id, max_bid, bid_offset, snipe_group, seller),
     )
     conn.commit()
     return cur.lastrowid
