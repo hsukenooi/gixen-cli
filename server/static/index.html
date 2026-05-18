@@ -331,7 +331,7 @@ function displayTitle(r) {
 
 // Escape arbitrary text for safe inclusion in HTML — element content OR
 // quoted attribute values. Used everywhere we interpolate user-controlled
-// data (eBay titles, sellers, comic notes) into a template literal that
+// data (eBay titles, sellers) into a template literal that
 // gets assigned to innerHTML.
 function escapeHtml(s) {
   return String(s ?? "")
@@ -341,8 +341,6 @@ function escapeHtml(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
-const attrEscape = escapeHtml;  // back-compat alias
-
 function buildFlags(snipes) {
   const lines = [];
   for (const r of snipes) {
@@ -425,7 +423,7 @@ function renderEnded(history) {
 function renderFlags(snipes) {
   const flags = buildFlags(snipes);
   const el = document.getElementById("flags-container");
-  el.innerHTML = flags.length ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${escapeHtml(f)}</li>`).join("")}</ul></div>` : "";
+  el.innerHTML = flags.length ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${f}</li>`).join("")}</ul></div>` : "";
 }
 
 function setStatus(state, text) {

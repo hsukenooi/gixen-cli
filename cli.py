@@ -328,7 +328,6 @@ def edit(item_id: str, max_bid: str, offset: int, group: int):
         sys.exit(1)
 
 
-
 @cli.command("group")
 @click.argument("group_n", type=click.IntRange(0, 10))
 @click.argument("item_ids", nargs=-1, required=True)
@@ -414,7 +413,6 @@ def sync():
         sys.exit(1)
     result = _server_request("post", "/api/sync")
     click.echo(f"Synced {result.get('synced', '?')} snipes from Gixen.")
-
 
 
 @cli.command()

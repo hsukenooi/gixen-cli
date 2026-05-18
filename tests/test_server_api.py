@@ -52,7 +52,7 @@ def test_health(api):
     assert r.json()["status"] == "ok"
 
 
-def test_add_bid_no_comic(api):
+def test_add_bid_minimal(api):
     r = api.post("/api/bids", json={
         "item_id": "123456789",
         "max_bid": 50.0,

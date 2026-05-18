@@ -387,6 +387,7 @@ async def _sniper_loop() -> None:
         except Exception:
             logger.exception("_sniper_loop: unexpected error, continuing")
         await asyncio.sleep(SNIPER_INTERVAL)
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -679,6 +680,8 @@ class EditBidRequest(BaseModel):
 
 
 class PurgeRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
     sibling_ids: list[str] = []
 
     @field_validator("sibling_ids")
