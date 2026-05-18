@@ -273,22 +273,21 @@ def _collect_dashboard_tabs(
     """
     try:
         tab_lists = pm.hook.register_dashboard_tabs()
+        flat: list[dict] = []
+        for lst in tab_lists:
+            if lst is None:
+                continue
+            if not isinstance(lst, list):
+                logger.error(
+                    "register_dashboard_tabs returned %s, expected list[dict]; "
+                    "skipping this plugin's tabs",
+                    type(lst).__name__,
+                )
+                continue
+            flat.extend(lst)
+        return flat
     except Exception:
         logger.exception(
             "register_dashboard_tabs failed; tab list may be incomplete"
         )
         return []
-
-    flat: list[dict] = []
-    for lst in tab_lists:
-        if lst is None:
-            continue
-        if not isinstance(lst, list):
-            logger.error(
-                "register_dashboard_tabs returned %s, expected list[dict]; "
-                "skipping this plugin's tabs",
-                type(lst).__name__,
-            )
-            continue
-        flat.extend(lst)
-    return flat

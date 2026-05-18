@@ -28,9 +28,8 @@ from gixen.plugins import (
 from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged, cache_gixen_data,
+    mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
-    link_comic_to_bid, get_comics_for_bid,
 )
 from server.comic_routes import router as comic_router
 import ebay_bidder

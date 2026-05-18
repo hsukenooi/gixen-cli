@@ -18,6 +18,8 @@ pytest tests/test_server_api.py
 pytest tests/test_server_db.py
 pytest tests/test_plugins.py
 pytest tests/test_plugin_integration.py
+pytest tests/test_comic_routes.py
+pytest tests/test_route_organization.py
 
 # Run integration tests (requires GIXEN_USERNAME and GIXEN_PASSWORD in .env)
 pytest -m integration
@@ -43,7 +45,7 @@ bash server/install.sh
 
 ## Architecture
 
-Four components:
+Five components:
 
 - **`gixen_client.py`** — `GixenClient` class that manages a `requests.Session`, handles login via HTML form POST, extracts session IDs from meta-refresh redirects, and parses the snipe table from raw HTML using regex. All Gixen operations (add/modify/remove/purge) work by POSTing form data to `home_2.php` with the session ID as a query param. Auto-re-logins on session expiration.
 - **`cli.py`** — Click CLI. When `GIXEN_SERVER_URL` is set in `.env`, routes writes (add/edit/remove/purge) to the FastAPI server and reads (`list`) from `GET /api/snipes`. When not set, talks directly to Gixen (existing behavior).
