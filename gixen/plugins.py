@@ -22,19 +22,23 @@ their hook implementations::
 from __future__ import annotations
 
 import logging
+import sqlite3
 from importlib.metadata import entry_points
+from typing import TYPE_CHECKING
 
 import pluggy
 
-__all__ = [
-    "hookimpl",
-    "hookspec",
-    "GixenPluginSpec",
-    "make_plugin_manager",
-    "load_plugins",
-]
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+# Plugin authors only need `hookimpl`. `hookspec`, `GixenPluginSpec`, and
+# `make_plugin_manager` are host-side primitives — re-exported in this module
+# for the host and tests but intentionally not in __all__.
+__all__ = ["hookimpl", "load_plugins"]
 
 _logger = logging.getLogger("gixen.plugins")
+
+_GROUP = "gixen.plugins"
 
 
 hookspec = pluggy.HookspecMarker("gixen")
@@ -57,7 +61,7 @@ class GixenPluginSpec:
     """
 
     @hookspec
-    def register_routes(self, app):
+    def register_routes(self, app: "FastAPI"):
         """Register FastAPI routes on the host application.
 
         :param app: the host FastAPI instance. Plugins typically build an
@@ -65,7 +69,7 @@ class GixenPluginSpec:
         """
 
     @hookspec
-    def register_db_tables(self, conn):
+    def register_db_tables(self, conn: sqlite3.Connection):
         """Create plugin-owned SQLite tables.
 
         :param conn: the host's open ``sqlite3.Connection``. Plugins should
@@ -106,8 +110,8 @@ def make_plugin_manager() -> pluggy.PluginManager:
     return pm
 
 
-def load_plugins(group: str = "gixen.plugins") -> pluggy.PluginManager:
-    """Discover and register all plugins declared under the entry-point group.
+def load_plugins() -> pluggy.PluginManager:
+    """Discover and register all plugins declared under ``gixen.plugins``.
 
     Plugins are registered in deterministic order — sorted by entry-point
     name — so that hook invocation order is reproducible across machines
@@ -122,7 +126,8 @@ def load_plugins(group: str = "gixen.plugins") -> pluggy.PluginManager:
     raises on plugin failure.
     """
     pm = make_plugin_manager()
-    for ep in sorted(entry_points(group=group), key=lambda e: e.name):
+    registered: list[str] = []
+    for ep in sorted(entry_points(group=_GROUP), key=lambda e: e.name):
         try:
             plugin = ep.load()
         except Exception:
@@ -132,16 +137,25 @@ def load_plugins(group: str = "gixen.plugins") -> pluggy.PluginManager:
             continue
         try:
             pm.register(plugin, name=ep.name)
+            registered.append(ep.name)
+            _logger.info("Plugin %s registered from %s", ep.name, ep.value)
         except Exception:
             _logger.exception("Plugin %s failed to register", ep.name)
 
     # Validate that every @hookimpl in registered plugins matches an existing
     # hookspec. Misspelled hook names (e.g. ``register_route`` vs
-    # ``register_routes``) raise PluginValidationError here.
+    # ``register_routes``) raise PluginValidationError here. The error message
+    # from pluggy includes the offending plugin name.
     try:
         pm.check_pending()
-    except Exception:
-        _logger.exception(
-            "Plugin validation failed (misspelled or unknown hookspec)"
+    except Exception as exc:
+        _logger.error("Plugin validation failed: %s", exc)
+
+    if registered:
+        _logger.info(
+            "Loaded %d plugin(s) from %s: %s",
+            len(registered), _GROUP, ", ".join(registered),
         )
+    else:
+        _logger.info("No plugins discovered in %s", _GROUP)
     return pm

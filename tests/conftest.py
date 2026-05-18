@@ -30,7 +30,9 @@ def fake_entry_points(monkeypatch):
         eps = []
         for name, mod in plugins.items():
             module_name = f"_test_fake_{name.replace('-', '_')}"
-            sys.modules[module_name] = mod
+            # Use monkeypatch.setitem so the sys.modules entry is rolled back
+            # at teardown — direct dict assignment would leak across tests.
+            monkeypatch.setitem(sys.modules, module_name, mod)
             eps.append(EntryPoint(name=name, value=module_name, group="gixen.plugins"))
 
         def fake(group: str):

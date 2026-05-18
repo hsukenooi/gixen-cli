@@ -561,11 +561,13 @@ async def lifespan(app: FastAPI):
     _ebay_fallback_lock = asyncio.Lock()
 
     # ----- Plugin loading -----
-    # Discover and register external plugins, then fire startup hooks. Per-plugin
-    # isolation is reserved for register_db_tables (DDL warrants savepoint
-    # rollback); routes and tabs use bulk pm.hook calls. One bad plugin's hook
-    # raising halts the chain — that's intentional, so the failure is loud and
-    # the operator sees it in logs.
+    # Discover and register external plugins, then fire startup hooks.
+    # Per-plugin isolation (savepoints) is reserved for register_db_tables
+    # because DDL needs per-plugin rollback granularity. Routes and tabs use
+    # bulk pm.hook calls — pluggy halts the impl chain on the first raise
+    # within one hook call, and the outer try/except logs and lets the server
+    # continue. Loud-failure posture: the operator sees the failure in logs
+    # rather than getting a silent partial registration.
     pm = load_plugins()
     app.state.plugin_manager = pm
 
@@ -582,8 +584,22 @@ async def lifespan(app: FastAPI):
             )(conn=_db)
             _db.execute(f"RELEASE {sp_name}")
         except Exception:
-            _db.execute(f"ROLLBACK TO {sp_name}")
-            _db.execute(f"RELEASE {sp_name}")
+            # The plugin's hook raised. Try to roll back its savepoint, but
+            # guard the cleanup itself — a plugin that called
+            # conn.executescript() will have already destroyed the savepoint
+            # via SQLite's implicit COMMIT, so ROLLBACK TO would raise
+            # OperationalError and escape this except block.
+            try:
+                _db.execute(f"ROLLBACK TO {sp_name}")
+                _db.execute(f"RELEASE {sp_name}")
+            except Exception:
+                logger.exception(
+                    "Savepoint cleanup failed for plugin %s; the plugin likely "
+                    "used conn.executescript() which is forbidden — see the "
+                    "register_db_tables hookspec docstring. Connection state "
+                    "may be inconsistent.",
+                    plugin_name,
+                )
             logger.exception(
                 "register_db_tables failed for plugin %s", plugin_name
             )
@@ -596,17 +612,33 @@ async def lifespan(app: FastAPI):
             "register_routes failed; some plugin routes may be missing"
         )
 
-    # Dashboard tabs — bulk call, flatten the list-of-lists.
+    # Dashboard tabs — bulk call, flatten the list-of-lists. Defensively
+    # require each plugin's contribution to be a list (or None); a plugin
+    # returning a bare dict would otherwise iterate over its keys and
+    # silently corrupt app.state.dashboard_tabs.
     try:
         tab_lists = pm.hook.register_dashboard_tabs()
-        app.state.dashboard_tabs = [t for lst in tab_lists for t in (lst or [])]
+        flat: list[dict] = []
+        for lst in tab_lists:
+            if lst is None:
+                continue
+            if not isinstance(lst, list):
+                logger.error(
+                    "register_dashboard_tabs returned %s, expected list[dict]; "
+                    "skipping this plugin's tabs",
+                    type(lst).__name__,
+                )
+                continue
+            flat.extend(lst)
+        app.state.dashboard_tabs = flat
     except Exception:
         logger.exception(
             "register_dashboard_tabs failed; tab list may be incomplete"
         )
         app.state.dashboard_tabs = []
 
-    # Force OpenAPI schema regeneration so plugin routes show up in /docs.
+    # Force OpenAPI schema regeneration so any plugin-registered routes show
+    # up in /docs. Set unconditionally — cheap even when no plugins ran.
     app.openapi_schema = None
     # ----- /Plugin loading -----
 

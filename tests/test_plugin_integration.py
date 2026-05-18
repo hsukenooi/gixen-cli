@@ -23,7 +23,7 @@ def _install_plugins(monkeypatch, plugins: dict[str, types.ModuleType]):
     eps = []
     for name, mod in plugins.items():
         module_name = f"_test_plugin_{name.replace('-', '_')}"
-        sys.modules[module_name] = mod
+        monkeypatch.setitem(sys.modules, module_name, mod)
         eps.append(EntryPoint(name=name, value=module_name, group="gixen.plugins"))
     monkeypatch.setattr(
         "gixen.plugins.entry_points",
@@ -240,3 +240,114 @@ def test_plugin_dashboard_tabs_collected(make_app, monkeypatch):
         assert tabs == [
             {"slug": "fake", "label": "Fake", "key": "f", "route": "/v2/fake"}
         ]
+
+
+# --- Error paths in the lifespan -----------------------------------------------
+
+
+def test_plugin_register_routes_raise_does_not_crash_server(make_app, monkeypatch, caplog):
+    """If a plugin's register_routes raises, the server still starts and core
+    routes still work. The exception is logged at ERROR."""
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("bad_route_plug")
+
+    @hookimpl
+    def register_routes(app):
+        raise RuntimeError("plugin route registration blew up")
+
+    mod.register_routes = register_routes
+    _install_plugins(monkeypatch, {"badroute": mod})
+
+    caplog.set_level(logging.ERROR, logger="server.main")
+    with make_app() as client:
+        # Core route still works.
+        assert client.get("/health").status_code == 200
+    # The exception was logged.
+    assert any("register_routes failed" in r.message for r in caplog.records)
+
+
+def test_plugin_register_dashboard_tabs_raise_falls_back_to_empty(make_app, monkeypatch, caplog):
+    """If a plugin's register_dashboard_tabs raises, app.state.dashboard_tabs
+    is set to [] and the server still starts."""
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("bad_tab_plug")
+
+    @hookimpl
+    def register_dashboard_tabs():
+        raise RuntimeError("tab plugin blew up")
+
+    mod.register_dashboard_tabs = register_dashboard_tabs
+    _install_plugins(monkeypatch, {"badtab": mod})
+
+    caplog.set_level(logging.ERROR, logger="server.main")
+    with make_app() as client:
+        assert client.app.state.dashboard_tabs == []
+        assert client.get("/health").status_code == 200
+    assert any("register_dashboard_tabs failed" in r.message for r in caplog.records)
+
+
+def test_plugin_register_dashboard_tabs_bare_dict_is_rejected(make_app, monkeypatch, caplog):
+    """A plugin returning a bare dict instead of list-of-dicts must NOT
+    produce string-keyed corruption in app.state.dashboard_tabs. The lifespan
+    skips the plugin's contribution with a clear log message.
+
+    Regression test for adversarial finding ADV-002: previously a bare dict
+    iterated as keys, producing app.state.dashboard_tabs == ['slug', 'label']."""
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("bare_dict_plug")
+
+    @hookimpl
+    def register_dashboard_tabs():
+        # Plugin author mistake: a single dict, not a list.
+        return {"slug": "wrong", "label": "Wrong"}
+
+    mod.register_dashboard_tabs = register_dashboard_tabs
+    _install_plugins(monkeypatch, {"baredict": mod})
+
+    caplog.set_level(logging.ERROR, logger="server.main")
+    with make_app() as client:
+        tabs = client.app.state.dashboard_tabs
+        # The bare dict is skipped entirely, not iterated as keys.
+        assert tabs == []
+    assert any(
+        "register_dashboard_tabs returned" in r.message
+        and "expected list" in r.message
+        for r in caplog.records
+    )
+
+
+def test_plugin_executescript_does_not_crash_lifespan(make_app, monkeypatch, caplog):
+    """A plugin that violates the hookspec (uses conn.executescript instead of
+    conn.execute) must not crash the entire server. The savepoint is
+    destroyed by executescript's implicit COMMIT, so the rollback attempt
+    raises OperationalError — but the lifespan must catch the secondary
+    exception and continue.
+
+    Regression test for reliability/correctness/adversarial finding (REL-01,
+    COR-01, ADV-001)."""
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("executescript_plug")
+
+    @hookimpl
+    def register_db_tables(conn):
+        # Forbidden per the hookspec docstring — but plugins will make this
+        # mistake, and the host must not crash when they do.
+        conn.executescript("CREATE TABLE bad_es_t (id INTEGER);")
+        raise RuntimeError("plugin raised after executescript")
+
+    mod.register_db_tables = register_db_tables
+    _install_plugins(monkeypatch, {"executescript-plug": mod})
+
+    caplog.set_level(logging.ERROR, logger="server.main")
+    with make_app() as client:
+        # Server still started.
+        assert client.get("/health").status_code == 200
+    # The savepoint-cleanup failure was logged.
+    assert any(
+        "Savepoint cleanup failed" in r.message or "conn.executescript" in r.message
+        for r in caplog.records
+    )

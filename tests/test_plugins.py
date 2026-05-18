@@ -62,26 +62,30 @@ def test_plugin_with_mismatched_hook_name_fails_check_pending():
         pm.check_pending()
 
 
-def test_module_exports():
-    """The public API of gixen.plugins is stable and exhaustive."""
+def test_module_exports_only_what_plugin_authors_need():
+    """Public __all__ is just hookimpl and load_plugins; host-side primitives
+    are accessible by attribute but intentionally not exported."""
     import gixen.plugins as mod
 
-    expected = {"hookimpl", "hookspec", "GixenPluginSpec", "make_plugin_manager", "load_plugins"}
-    assert set(mod.__all__) == expected
-    for name in expected:
+    assert set(mod.__all__) == {"hookimpl", "load_plugins"}
+    # Host-side primitives must still be importable by name.
+    for name in ("hookspec", "GixenPluginSpec", "make_plugin_manager"):
         assert hasattr(mod, name), f"gixen.plugins missing {name}"
 
 
-def test_hookimpl_works_via_re_export():
-    """Plugin authors should be able to `from gixen.plugins import hookimpl`."""
+def test_hookimpl_applies_pluggy_marker():
+    """`from gixen.plugins import hookimpl` produces a decorator that marks
+    the function with pluggy's project-scoped impl attribute."""
     from gixen.plugins import hookimpl
 
     @hookimpl
     def register_routes(app):
         return None
 
-    # The decorator should have left behind the pluggy hookimpl marker.
-    assert hasattr(register_routes, "gixen_impl") or hasattr(register_routes, "pluggy_impl_meta") or callable(register_routes)
+    # pluggy stores the impl marker under `<project_name>_impl` — `gixen_impl`
+    # for our manager. This is the load-bearing assertion: if the re-export
+    # ever broke, this attribute would be missing.
+    assert hasattr(register_routes, "gixen_impl")
 
 
 # --- Unit 3: loader + entry-point discovery -------------------------------------
@@ -132,17 +136,16 @@ def test_load_plugins_sorts_by_entry_point_name(fake_entry_points):
     assert names == ["a", "b", "c"]
 
 
-def test_load_plugins_isolates_import_failure(fake_entry_points, caplog, monkeypatch):
+def test_load_plugins_isolates_import_failure(caplog, monkeypatch):
     """A plugin whose ep.load() raises is logged and skipped; others register."""
     import sys
-    import types
     from importlib.metadata import EntryPoint
 
     from gixen.plugins import load_plugins
 
     # Build one healthy plugin and one entry point that points at a broken module.
     healthy = _plugin_module("healthy", register_routes=lambda app: None)
-    sys.modules["_test_healthy_module"] = healthy
+    monkeypatch.setitem(sys.modules, "_test_healthy_module", healthy)
 
     # Broken entry point: target module raises on import. We simulate this by
     # pointing at a name that ep.load() can't resolve.
@@ -167,25 +170,22 @@ def test_load_plugins_isolates_import_failure(fake_entry_points, caplog, monkeyp
     assert any("broken" in r.message for r in caplog.records)
 
 
-def test_load_plugins_isolates_registration_failure(fake_entry_points, caplog, monkeypatch):
+def test_load_plugins_isolates_registration_failure(caplog, monkeypatch):
     """A plugin whose pm.register() raises (e.g. duplicate name) is logged + skipped."""
     import logging
-
-    from gixen.plugins import load_plugins
-
-    # Two plugins, both claiming name "dup" — pluggy enforces uniqueness on
-    # the second register() call.
-    plug1 = _plugin_module("dup1", register_routes=lambda app: None)
-    plug2 = _plugin_module("dup2", register_routes=lambda app: None)
-    fake_entry_points({"dup": plug1, "dup": plug2})
-    # Note: dict literal collapses duplicate keys, so above only registers one.
-    # Patch in a second entry-point with the same name via monkeypatch directly.
-
     import sys
     from importlib.metadata import EntryPoint
 
-    sys.modules["_test_dup_a"] = plug1
-    sys.modules["_test_dup_b"] = plug2
+    from gixen.plugins import load_plugins
+
+    # Two distinct plugins, both claiming entry-point name "dup". pluggy
+    # enforces name uniqueness on the second register() call. Build the
+    # entry-points list directly (a dict literal would collapse the duplicate
+    # key into one entry).
+    plug1 = _plugin_module("dup1", register_routes=lambda app: None)
+    plug2 = _plugin_module("dup2", register_routes=lambda app: None)
+    monkeypatch.setitem(sys.modules, "_test_dup_a", plug1)
+    monkeypatch.setitem(sys.modules, "_test_dup_b", plug2)
     eps = [
         EntryPoint(name="dup", value="_test_dup_a", group="gixen.plugins"),
         EntryPoint(name="dup", value="_test_dup_b", group="gixen.plugins"),
