@@ -571,6 +571,7 @@ async def lifespan(app: FastAPI):
         load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
+    app.state.db = _db
     _api_client = GixenClient()
     _api_lock = asyncio.Lock()
     _sync_lock = asyncio.Lock()
@@ -694,6 +695,7 @@ async def lifespan(app: FastAPI):
     if row and row[0]:
         logger.warning("WAL checkpoint incomplete: busy=%s", row[0])
     _db.close()
+    app.state.db = None
 
 
 app = FastAPI(lifespan=lifespan)

@@ -80,6 +80,10 @@ class GixenPluginSpec:
         DDL executed in this hook is wrapped in a SQLite savepoint by the
         host; a failure rolls back this plugin's DDL only.
 
+        ``app.state.db`` is guaranteed to be set to the same connection by the
+        host before this hook fires. Plugins can read it via the FastAPI
+        request lifecycle later (e.g. ``request.app.state.db``).
+
         **Important:** call ``conn.execute(...)`` per statement, NOT
         ``conn.executescript(...)``. Python's sqlite3 ``executescript``
         implicitly commits any pending transaction before running, which
