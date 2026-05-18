@@ -1,8 +1,0 @@
-requests
-click
-python-dotenv
-pytest
-fastapi
-uvicorn[standard]
-httpx
-playwright

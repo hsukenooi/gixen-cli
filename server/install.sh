@@ -24,7 +24,7 @@ fi
 
 echo "==> Creating Python venv"
 python3 -m venv "$VENV"
-"$VENV/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
+"$VENV/bin/pip" install -q -e "$REPO_DIR"
 
 echo "==> Writing LaunchAgent plist to $PLIST"
 cat > "$PLIST" <<PLIST

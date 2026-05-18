@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gixen-cli"
+version = "0.3.0"
+description = "Python CLI for managing eBay snipes on Gixen.com, with a FastAPI server and plugin entry-point system."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Hsu Ken Ooi" }]
+dependencies = [
+    "click>=8.1",
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+    "fastapi>=0.136,<0.150",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.28",
+    "playwright>=1.45",
+    "pluggy>=1.6",
+]
+
+[project.scripts]
+gixen = "cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server", "gixen"]
+include = ["cli.py", "gixen_client.py", "ebay_bidder.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "cli.py",
+    "gixen_client.py",
+    "ebay_bidder.py",
+    "server/",
+    "gixen/",
+    "tests/",
+    "README.md",
+    "CLAUDE.md",
+    "pyproject.toml",
+]

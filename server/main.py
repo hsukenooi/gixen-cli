@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
+from gixen.plugins import load_plugins
 from server.db import (
     DB_PATH, init_db, upsert_comic, list_comics, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
@@ -46,6 +47,22 @@ except ImportError as _ebay_import_err:
     _EBAY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# The host configures the plugin subsystem's logger explicitly so the audit
+# trail emitted by load_plugins() (plugin discovery, registration, validation
+# errors) is visible at INFO. Uvicorn does not configure the root logger by
+# default, so propagation alone wouldn't show these messages — attach a
+# stream handler with a uvicorn-style prefix so the lines blend into the
+# normal startup log.
+_plugin_logger = logging.getLogger("gixen.plugins")
+_plugin_logger.setLevel(logging.INFO)
+if not _plugin_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:     gixen.plugins: %(message)s"))
+    _plugin_logger.addHandler(_h)
+# Note: propagate stays True so pytest's caplog (which attaches to root) can
+# capture these records in tests. Uvicorn's default config attaches no root
+# handler, so propagation does not cause double-logging in production.
 
 if not _EBAY_AVAILABLE:
     logger.warning("ebay_fetch not importable from %s — live eBay data disabled", _EBAY_CLI_DIR)
@@ -558,6 +575,88 @@ async def lifespan(app: FastAPI):
     _api_lock = asyncio.Lock()
     _sync_lock = asyncio.Lock()
     _ebay_fallback_lock = asyncio.Lock()
+
+    # ----- Plugin loading -----
+    # Discover and register external plugins, then fire startup hooks.
+    # Per-plugin isolation (savepoints) is reserved for register_db_tables
+    # because DDL needs per-plugin rollback granularity. Routes and tabs use
+    # bulk pm.hook calls — pluggy halts the impl chain on the first raise
+    # within one hook call, and the outer try/except logs and lets the server
+    # continue. Loud-failure posture: the operator sees the failure in logs
+    # rather than getting a silent partial registration.
+    pm = load_plugins()
+    app.state.plugin_manager = pm
+
+    # Tables first: plugin routes may query plugin tables. Each plugin's DDL
+    # runs inside its own SQLite savepoint; failure rolls back this plugin
+    # only, leaves the connection usable for the next plugin and for core.
+    for plugin_name, _plugin in pm.list_name_plugin():
+        sp_name = "sp_" + re.sub(r"[^a-z0-9_]", "_", plugin_name.lower())
+        try:
+            _db.execute(f"SAVEPOINT {sp_name}")
+            others = [p for n, p in pm.list_name_plugin() if n != plugin_name]
+            pm.subset_hook_caller(
+                "register_db_tables", remove_plugins=others
+            )(conn=_db)
+            _db.execute(f"RELEASE {sp_name}")
+        except Exception:
+            # The plugin's hook raised. Try to roll back its savepoint, but
+            # guard the cleanup itself — a plugin that called
+            # conn.executescript() will have already destroyed the savepoint
+            # via SQLite's implicit COMMIT, so ROLLBACK TO would raise
+            # OperationalError and escape this except block.
+            try:
+                _db.execute(f"ROLLBACK TO {sp_name}")
+                _db.execute(f"RELEASE {sp_name}")
+            except Exception:
+                logger.exception(
+                    "Savepoint cleanup failed for plugin %s; the plugin likely "
+                    "used conn.executescript() which is forbidden — see the "
+                    "register_db_tables hookspec docstring. Connection state "
+                    "may be inconsistent.",
+                    plugin_name,
+                )
+            logger.exception(
+                "register_db_tables failed for plugin %s", plugin_name
+            )
+
+    # Routes — bulk call.
+    try:
+        pm.hook.register_routes(app=app)
+    except Exception:
+        logger.exception(
+            "register_routes failed; some plugin routes may be missing"
+        )
+
+    # Dashboard tabs — bulk call, flatten the list-of-lists. Defensively
+    # require each plugin's contribution to be a list (or None); a plugin
+    # returning a bare dict would otherwise iterate over its keys and
+    # silently corrupt app.state.dashboard_tabs.
+    try:
+        tab_lists = pm.hook.register_dashboard_tabs()
+        flat: list[dict] = []
+        for lst in tab_lists:
+            if lst is None:
+                continue
+            if not isinstance(lst, list):
+                logger.error(
+                    "register_dashboard_tabs returned %s, expected list[dict]; "
+                    "skipping this plugin's tabs",
+                    type(lst).__name__,
+                )
+                continue
+            flat.extend(lst)
+        app.state.dashboard_tabs = flat
+    except Exception:
+        logger.exception(
+            "register_dashboard_tabs failed; tab list may be incomplete"
+        )
+        app.state.dashboard_tabs = []
+
+    # Force OpenAPI schema regeneration so any plugin-registered routes show
+    # up in /docs. Set unconditionally — cheap even when no plugins ran.
+    app.openapi_schema = None
+    # ----- /Plugin loading -----
 
     sync_task = None
     sniper_task = None
