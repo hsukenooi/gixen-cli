@@ -637,6 +637,11 @@ app.include_router(comic_router)
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+class TabSpec(BaseModel):
+    label: str
+    path: str
+
+
 class AddBidRequest(BaseModel):
     item_id: str
     max_bid: float
@@ -744,7 +749,7 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/api/dashboard-tabs")
+@app.get("/api/dashboard-tabs", response_model=list[TabSpec])
 def api_dashboard_tabs(request: Request) -> list[dict]:
     return getattr(request.app.state, "dashboard_tabs", [])
 
