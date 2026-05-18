@@ -19,7 +19,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
-from gixen.plugins import load_plugins
+from gixen.plugins import (
+    load_plugins,
+    _invoke_db_tables_isolated,
+    _invoke_register_routes,
+    _collect_dashboard_tabs,
+)
 from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
@@ -577,87 +582,15 @@ async def lifespan(app: FastAPI):
     _sync_lock = asyncio.Lock()
     _ebay_fallback_lock = asyncio.Lock()
 
-    # ----- Plugin loading -----
-    # Discover and register external plugins, then fire startup hooks.
-    # Per-plugin isolation (savepoints) is reserved for register_db_tables
-    # because DDL needs per-plugin rollback granularity. Routes and tabs use
-    # bulk pm.hook calls — pluggy halts the impl chain on the first raise
-    # within one hook call, and the outer try/except logs and lets the server
-    # continue. Loud-failure posture: the operator sees the failure in logs
-    # rather than getting a silent partial registration.
+    # Plugin loading: discover entry-point plugins, then fire startup hooks.
+    # Helpers live in gixen/plugins.py (PER-26 M-01); they accept an injected
+    # logger so log records appear under the "server.main" logger name that
+    # PER-25 regression tests assert on.
     pm = load_plugins()
     app.state.plugin_manager = pm
-
-    # Tables first: plugin routes may query plugin tables. Each plugin's DDL
-    # runs inside its own SQLite savepoint; failure rolls back this plugin
-    # only, leaves the connection usable for the next plugin and for core.
-    for plugin_name, _plugin in pm.list_name_plugin():
-        sp_name = "sp_" + re.sub(r"[^a-z0-9_]", "_", plugin_name.lower())
-        try:
-            _db.execute(f"SAVEPOINT {sp_name}")
-            others = [p for n, p in pm.list_name_plugin() if n != plugin_name]
-            pm.subset_hook_caller(
-                "register_db_tables", remove_plugins=others
-            )(conn=_db)
-            _db.execute(f"RELEASE {sp_name}")
-        except Exception:
-            # The plugin's hook raised. Try to roll back its savepoint, but
-            # guard the cleanup itself — a plugin that called
-            # conn.executescript() will have already destroyed the savepoint
-            # via SQLite's implicit COMMIT, so ROLLBACK TO would raise
-            # OperationalError and escape this except block.
-            try:
-                _db.execute(f"ROLLBACK TO {sp_name}")
-                _db.execute(f"RELEASE {sp_name}")
-            except Exception:
-                logger.exception(
-                    "Savepoint cleanup failed for plugin %s; the plugin likely "
-                    "used conn.executescript() which is forbidden — see the "
-                    "register_db_tables hookspec docstring. Connection state "
-                    "may be inconsistent.",
-                    plugin_name,
-                )
-            logger.exception(
-                "register_db_tables failed for plugin %s", plugin_name
-            )
-
-    # Routes — bulk call.
-    try:
-        pm.hook.register_routes(app=app)
-    except Exception:
-        logger.exception(
-            "register_routes failed; some plugin routes may be missing"
-        )
-
-    # Dashboard tabs — bulk call, flatten the list-of-lists. Defensively
-    # require each plugin's contribution to be a list (or None); a plugin
-    # returning a bare dict would otherwise iterate over its keys and
-    # silently corrupt app.state.dashboard_tabs.
-    try:
-        tab_lists = pm.hook.register_dashboard_tabs()
-        flat: list[dict] = []
-        for lst in tab_lists:
-            if lst is None:
-                continue
-            if not isinstance(lst, list):
-                logger.error(
-                    "register_dashboard_tabs returned %s, expected list[dict]; "
-                    "skipping this plugin's tabs",
-                    type(lst).__name__,
-                )
-                continue
-            flat.extend(lst)
-        app.state.dashboard_tabs = flat
-    except Exception:
-        logger.exception(
-            "register_dashboard_tabs failed; tab list may be incomplete"
-        )
-        app.state.dashboard_tabs = []
-
-    # Force OpenAPI schema regeneration so any plugin-registered routes show
-    # up in /docs. Set unconditionally — cheap even when no plugins ran.
-    app.openapi_schema = None
-    # ----- /Plugin loading -----
+    _invoke_db_tables_isolated(pm, _db, logger=logger)
+    _invoke_register_routes(pm, app, logger=logger)
+    app.state.dashboard_tabs = _collect_dashboard_tabs(pm, logger=logger)
 
     sync_task = None
     sniper_task = None
