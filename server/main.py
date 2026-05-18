@@ -26,12 +26,11 @@ from gixen.plugins import (
     _collect_dashboard_tabs,
 )
 from server.db import (
-    DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
+    DB_PATH, init_db, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
 )
-from server.comic_routes import router as comic_router
 import ebay_bidder
 
 # Import eBay helpers from the sibling project. Path is overridable via
@@ -631,7 +630,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.include_router(comic_router)
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -643,21 +641,12 @@ class TabSpec(BaseModel):
 
 
 class AddBidRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
     item_id: str
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
-    comic: str | None = None
-    issue: str | None = None
-    year: int | None = None
-    grade: float | None = None
-    fmv_low: float | None = None
-    fmv_high: float | None = None
-    fmv_comps: int | None = None
-    fmv_confidence: str | None = None
-    fmv_notes: str | None = None
-    locg_id: int | None = None
-    locg_variant_id: int | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -673,20 +662,13 @@ class AddBidRequest(BaseModel):
             raise ValueError("max_bid must be positive")
         return v
 
-    @field_validator("fmv_confidence")
-    @classmethod
-    def validate_confidence(cls, v: str | None) -> str | None:
-        if v is not None and v not in ("high", "medium", "low"):
-            raise ValueError("fmv_confidence must be high, medium, or low")
-        return v
-
 
 class EditBidRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
-    locg_id: int | None = None
-    locg_variant_id: int | None = None
 
     @field_validator("max_bid")
     @classmethod
@@ -757,24 +739,6 @@ def api_dashboard_tabs(request: Request) -> list[dict]:
 @app.post("/api/bids")
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
-
-    comic_id = None
-    if req.comic and req.issue and req.year is not None:
-        comic_id = upsert_comic(
-            db,
-            title=req.comic,
-            issue=req.issue,
-            year=req.year,
-            grade=req.grade,
-            fmv_low=req.fmv_low,
-            fmv_high=req.fmv_high,
-            fmv_comps=req.fmv_comps,
-            fmv_confidence=req.fmv_confidence,
-            fmv_notes=req.fmv_notes,
-            locg_id=req.locg_id,
-            locg_variant_id=req.locg_variant_id,
-        )
-
     try:
         async with _api_lock:
             await asyncio.to_thread(
@@ -793,7 +757,7 @@ async def api_add_bid(req: AddBidRequest):
         db,
         item_id=req.item_id,
         max_bid=req.max_bid,
-        comic_id=comic_id,
+        comic_id=None,
         bid_offset=req.bid_offset,
         snipe_group=req.snipe_group,
         seller=None,
@@ -815,57 +779,18 @@ async def api_get_snipes():
     db = _get_db()
 
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
-               c.locg_id, c.locg_variant_id
-        FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
-        WHERE b.status != 'PURGED'
-        ORDER BY b.added_at DESC
+        SELECT * FROM bids
+        WHERE status != 'PURGED'
+        ORDER BY added_at DESC
     """).fetchall()
-
-    # Second query: every comic linked via bid_comics, keyed by bid_id. This
-    # gives us the full lot-aware view (1 bid → N comics) without disturbing
-    # the flat fields above (still populated from the primary via bids.comic_id).
-    bid_ids = [r["id"] for r in rows]
-    comics_by_bid: dict[int, list[dict]] = {bid_id: [] for bid_id in bid_ids}
-    if bid_ids:
-        placeholders = ",".join("?" * len(bid_ids))
-        comic_rows = db.execute(
-            f"""
-            SELECT bc.bid_id, bc.is_primary, c.id AS comic_id,
-                   c.title, c.issue, c.year, c.grade,
-                   c.locg_id, c.locg_variant_id
-            FROM bid_comics bc
-            JOIN comics c ON c.id = bc.comic_id
-            WHERE bc.bid_id IN ({placeholders})
-            ORDER BY bc.bid_id, bc.is_primary DESC,
-                     CAST(c.issue AS INTEGER), c.issue
-            """,
-            bid_ids,
-        ).fetchall()
-        for cr in comic_rows:
-            comics_by_bid[cr["bid_id"]].append({
-                "comic_id": cr["comic_id"],
-                "title": cr["title"],
-                "issue": cr["issue"],
-                "year": cr["year"],
-                "grade": cr["grade"],
-                "locg_id": cr["locg_id"],
-                "locg_variant_id": cr["locg_variant_id"],
-                "is_primary": bool(cr["is_primary"]),
-            })
 
     result = []
     for row in rows:
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
-        title = item.get("ebay_title") or item.get("comic_title") or ""
         result.append({
             "item_id": item["item_id"],
-            "title": title,
+            "title": item.get("ebay_title") or "",
             "current_bid": item.get("cached_current_bid"),
             "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
@@ -877,21 +802,9 @@ async def api_get_snipes():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "cached_at": item.get("cached_at"),
-            "comic_title": item.get("comic_title"),
-            "comic_issue": item.get("comic_issue"),
-            "comic_year": item.get("comic_year"),
-            "comic_grade": item.get("comic_grade"),
-            "fmv_low": item.get("fmv_low"),
-            "fmv_high": item.get("fmv_high"),
-            "fmv_comps": item.get("fmv_comps"),
-            "fmv_confidence": item.get("fmv_confidence"),
-            "fmv_notes": item.get("fmv_notes"),
             "comic_id": item.get("comic_id"),
-            "locg_id": item.get("locg_id"),
-            "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
-            "comics": comics_by_bid.get(item["id"], []),
         })
 
     return result
@@ -904,33 +817,26 @@ async def api_get_history():
     """
     db = _get_db()
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
-               c.locg_id, c.locg_variant_id
-        FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
+        SELECT * FROM bids
         WHERE (
-          b.auction_end_at IS NOT NULL
-          AND datetime(b.auction_end_at) <= datetime('now')
-          AND datetime(b.auction_end_at) >= datetime('now', '-7 days')
+          auction_end_at IS NOT NULL
+          AND datetime(auction_end_at) <= datetime('now')
+          AND datetime(auction_end_at) >= datetime('now', '-7 days')
         ) OR (
-          b.auction_end_at IS NULL
-          AND b.resolved_at IS NOT NULL
-          AND datetime(b.resolved_at) >= datetime('now', '-7 days')
+          auction_end_at IS NULL
+          AND resolved_at IS NOT NULL
+          AND datetime(resolved_at) >= datetime('now', '-7 days')
         )
-        ORDER BY COALESCE(b.auction_end_at, b.resolved_at) DESC
+        ORDER BY COALESCE(auction_end_at, resolved_at) DESC
     """).fetchall()
 
     result = []
     for row in rows:
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
-        title = item.get("ebay_title") or item.get("comic_title") or ""
         result.append({
             "item_id": item["item_id"],
-            "title": title,
+            "title": item.get("ebay_title") or "",
             "current_bid": item.get("cached_current_bid"),
             "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
@@ -942,18 +848,7 @@ async def api_get_history():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "cached_at": item.get("cached_at"),
-            "comic_title": item.get("comic_title"),
-            "comic_issue": item.get("comic_issue"),
-            "comic_year": item.get("comic_year"),
-            "comic_grade": item.get("comic_grade"),
-            "fmv_low": item.get("fmv_low"),
-            "fmv_high": item.get("fmv_high"),
-            "fmv_comps": item.get("fmv_comps"),
-            "fmv_confidence": item.get("fmv_confidence"),
-            "fmv_notes": item.get("fmv_notes"),
             "comic_id": item.get("comic_id"),
-            "locg_id": item.get("locg_id"),
-            "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })
@@ -965,28 +860,20 @@ async def api_get_all_bids():
     """All bids from the DB, newest first. Pure DB read — no Gixen sync."""
     db = _get_db()
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
-               c.locg_id, c.locg_variant_id
-        FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
-        ORDER BY COALESCE(b.auction_end_at, b.added_at) DESC
+        SELECT * FROM bids
+        ORDER BY COALESCE(auction_end_at, added_at) DESC
     """).fetchall()
 
     result = []
     for row in rows:
         item = dict(row)
-        end_date_iso = item.get("auction_end_at")
-        title = item.get("ebay_title") or item.get("comic_title") or ""
         result.append({
             "item_id": item["item_id"],
-            "title": title,
+            "title": item.get("ebay_title") or "",
             "max_bid": item["max_bid"],
             "bid_offset": item["bid_offset"],
             "snipe_group": item["snipe_group"],
-            "end_date_iso": end_date_iso,
+            "end_date_iso": item.get("auction_end_at"),
             "added_at": item.get("added_at"),
             "status": item["status"],
             "status_mirror": item.get("status_mirror"),
@@ -1021,22 +908,6 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
 
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
-
-    # If locg_id / locg_variant_id provided, persist on the linked comic row.
-    # COALESCE preserves existing values when only one of the two is supplied.
-    if req.locg_id is not None or req.locg_variant_id is not None:
-        bid_row = get_bid_by_item_id(db, item_id)
-        if bid_row is not None and bid_row["comic_id"] is not None:
-            db.execute(
-                """
-                UPDATE comics
-                SET locg_id = COALESCE(?, locg_id),
-                    locg_variant_id = COALESCE(?, locg_variant_id)
-                WHERE id = ?
-                """,
-                (req.locg_id, req.locg_variant_id, bid_row["comic_id"]),
-            )
-            db.commit()
 
     row = get_bid_by_item_id(db, item_id)
     if row is None:
