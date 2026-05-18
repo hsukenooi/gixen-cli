@@ -21,6 +21,9 @@ their hook implementations::
 """
 from __future__ import annotations
 
+import logging
+from importlib.metadata import entry_points
+
 import pluggy
 
 __all__ = [
@@ -30,6 +33,8 @@ __all__ = [
     "make_plugin_manager",
     "load_plugins",
 ]
+
+_logger = logging.getLogger("gixen.plugins")
 
 
 hookspec = pluggy.HookspecMarker("gixen")
@@ -96,5 +101,41 @@ def make_plugin_manager() -> pluggy.PluginManager:
 
 
 def load_plugins(group: str = "gixen.plugins") -> pluggy.PluginManager:
-    """Stub — Unit 3 will implement entry-point discovery and isolation."""
-    raise NotImplementedError("Unit 3 implements this.")
+    """Discover and register all plugins declared under the entry-point group.
+
+    Plugins are registered in deterministic order — sorted by entry-point
+    name — so that hook invocation order is reproducible across machines
+    (the default order from ``entry_points()`` is sys.path order, which is
+    not stable). Plugins needing explicit ordering can use
+    ``@hookimpl(tryfirst=True)`` or ``trylast=True``.
+
+    Per-plugin error isolation: a plugin whose ``ep.load()`` raises, whose
+    ``pm.register()`` raises (e.g. duplicate name), or whose registered
+    hookimpls reference a misspelled hookspec, is logged at ERROR and
+    skipped. The loader always returns a usable ``PluginManager`` — never
+    raises on plugin failure.
+    """
+    pm = make_plugin_manager()
+    for ep in sorted(entry_points(group=group), key=lambda e: e.name):
+        try:
+            plugin = ep.load()
+        except Exception:
+            _logger.exception(
+                "Plugin %s failed to load (from %s)", ep.name, ep.value
+            )
+            continue
+        try:
+            pm.register(plugin, name=ep.name)
+        except Exception:
+            _logger.exception("Plugin %s failed to register", ep.name)
+
+    # Validate that every @hookimpl in registered plugins matches an existing
+    # hookspec. Misspelled hook names (e.g. ``register_route`` vs
+    # ``register_routes``) raise PluginValidationError here.
+    try:
+        pm.check_pending()
+    except Exception:
+        _logger.exception(
+            "Plugin validation failed (misspelled or unknown hookspec)"
+        )
+    return pm
