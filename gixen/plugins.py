@@ -22,6 +22,7 @@ their hook implementations::
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING
@@ -79,6 +80,10 @@ class GixenPluginSpec:
 
         DDL executed in this hook is wrapped in a SQLite savepoint by the
         host; a failure rolls back this plugin's DDL only.
+
+        ``app.state.db`` is guaranteed to be set to the same connection by the
+        host before this hook fires. Plugins can read it via the FastAPI
+        request lifecycle later (e.g. ``request.app.state.db``).
 
         **Important:** call ``conn.execute(...)`` per statement, NOT
         ``conn.executescript(...)``. Python's sqlite3 ``executescript``
@@ -159,3 +164,130 @@ def load_plugins() -> pluggy.PluginManager:
     else:
         _logger.info("No plugins discovered in %s", _GROUP)
     return pm
+
+
+# ---------------------------------------------------------------------------
+# Host-side helpers — invoked by the FastAPI lifespan in server/main.py.
+#
+# These are underscore-prefixed because they are NOT part of the plugin
+# author's API. ``__all__`` lists only what plugin authors should import;
+# these helpers are the host's machinery for firing the hooks correctly,
+# with per-plugin isolation for DDL and defensive error handling for the
+# bulk hooks. PER-25 review's M-01 finding wanted this plumbing out of the
+# server's lifespan; PER-26 Unit 3 delivers that.
+#
+# Each helper accepts a keyword-only ``logger`` so the lifespan can pass
+# ``logging.getLogger("server.main")`` and existing PER-25 regression tests
+# that assert on ``caplog.set_level(..., logger="server.main")`` continue to
+# capture the cleanup-failure records.
+# ---------------------------------------------------------------------------
+
+
+def _invoke_db_tables_isolated(
+    pm: pluggy.PluginManager,
+    conn: sqlite3.Connection,
+    *,
+    logger: logging.Logger,
+) -> list[str]:
+    """Fire ``register_db_tables`` per plugin inside a SQLite savepoint.
+
+    Each plugin's DDL runs in its own savepoint; failure rolls back this
+    plugin only and leaves the connection usable for the next plugin and
+    for core. A plugin that violates the hookspec by calling
+    ``conn.executescript(...)`` implicitly COMMITs the transaction and
+    destroys the savepoint — the inner ``ROLLBACK TO`` would then raise
+    ``OperationalError``. We guard that secondary failure so the lifespan
+    keeps going. (PER-25 ADV-001 / REL-01 / COR-01.)
+
+    Returns the list of plugin names whose DDL succeeded, for caller logging.
+    """
+    succeeded: list[str] = []
+    for plugin_name, _plugin in pm.list_name_plugin():
+        sp_name = "sp_" + re.sub(r"[^a-z0-9_]", "_", plugin_name.lower())
+        try:
+            conn.execute(f"SAVEPOINT {sp_name}")
+            others = [p for n, p in pm.list_name_plugin() if n != plugin_name]
+            pm.subset_hook_caller(
+                "register_db_tables", remove_plugins=others
+            )(conn=conn)
+            conn.execute(f"RELEASE {sp_name}")
+            succeeded.append(plugin_name)
+        except Exception:
+            try:
+                conn.execute(f"ROLLBACK TO {sp_name}")
+                conn.execute(f"RELEASE {sp_name}")
+            except Exception:
+                logger.exception(
+                    "Savepoint cleanup failed for plugin %s; the plugin likely "
+                    "used conn.executescript() which is forbidden — see the "
+                    "register_db_tables hookspec docstring. Connection state "
+                    "may be inconsistent.",
+                    plugin_name,
+                )
+            logger.exception(
+                "register_db_tables failed for plugin %s", plugin_name
+            )
+    return succeeded
+
+
+def _invoke_register_routes(
+    pm: pluggy.PluginManager,
+    app: "FastAPI",
+    *,
+    logger: logging.Logger,
+) -> None:
+    """Fire the bulk ``register_routes`` hook and force OpenAPI regen.
+
+    Pluggy halts the impl chain on the first raise within one hook call.
+    PER-25 chose this loud-failure posture deliberately: operators see the
+    failure in logs rather than getting silently partial registration. The
+    outer try/except logs and lets the server continue to start.
+
+    ``app.openapi_schema = None`` runs in a finally block so the schema is
+    consistent regardless of whether plugins succeeded — cheap when no
+    plugins ran, essential when they did.
+    """
+    try:
+        pm.hook.register_routes(app=app)
+    except Exception:
+        logger.exception(
+            "register_routes failed; some plugin routes may be missing"
+        )
+    finally:
+        app.openapi_schema = None
+
+
+def _collect_dashboard_tabs(
+    pm: pluggy.PluginManager,
+    *,
+    logger: logging.Logger,
+) -> list[dict]:
+    """Fire the bulk ``register_dashboard_tabs`` hook and flatten results.
+
+    Each plugin's contribution must be a ``list[dict]``. A plugin that
+    returns a bare dict would iterate as keys and silently corrupt the
+    flattened output; guard with ``isinstance(x, list)`` and skip with a
+    clear log message. (PER-25 ADV-002.)
+
+    On a top-level failure of the bulk hook call, returns an empty list.
+    """
+    try:
+        tab_lists = pm.hook.register_dashboard_tabs()
+        flat: list[dict] = []
+        for lst in tab_lists:
+            if lst is None:
+                continue
+            if not isinstance(lst, list):
+                logger.error(
+                    "register_dashboard_tabs returned %s, expected list[dict]; "
+                    "skipping this plugin's tabs",
+                    type(lst).__name__,
+                )
+                continue
+            flat.extend(lst)
+        return flat
+    except Exception:
+        logger.exception(
+            "register_dashboard_tabs failed; tab list may be incomplete"
+        )
+        return []

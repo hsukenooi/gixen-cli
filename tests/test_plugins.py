@@ -255,3 +255,247 @@ def test_load_plugins_end_to_end_hook_invocation(fake_entry_points):
     pm = load_plugins()
     pm.hook.register_routes(app=object())
     assert state["touched"] is True
+
+
+# --- PER-26 Unit 3: M-01 host-side helpers --------------------------------------
+
+
+def _conn():
+    """Fresh in-memory SQLite connection — caller closes."""
+    import sqlite3
+    return sqlite3.connect(":memory:")
+
+
+def test_invoke_db_tables_isolated_with_no_plugins_returns_empty(fake_entry_points):
+    """No plugins → empty list, no DDL run."""
+    import logging
+    from gixen.plugins import _invoke_db_tables_isolated, load_plugins
+
+    fake_entry_points({})
+    pm = load_plugins()
+    conn = _conn()
+    try:
+        result = _invoke_db_tables_isolated(pm, conn, logger=logging.getLogger("test"))
+        assert result == []
+    finally:
+        conn.close()
+
+
+def test_invoke_db_tables_isolated_succeeds_with_one_plugin(fake_entry_points):
+    from gixen.plugins import _invoke_db_tables_isolated, load_plugins
+
+    def register_db_tables(conn):
+        conn.execute("CREATE TABLE good_t (id INTEGER PRIMARY KEY)")
+
+    plug = _plugin_module("good_plug", register_db_tables=register_db_tables)
+    fake_entry_points({"good": plug})
+
+    import logging
+    pm = load_plugins()
+    conn = _conn()
+    try:
+        result = _invoke_db_tables_isolated(pm, conn, logger=logging.getLogger("test"))
+        assert result == ["good"]
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='good_t'"
+        ).fetchone()
+        assert row is not None
+    finally:
+        conn.close()
+
+
+def test_invoke_db_tables_isolated_rolls_back_on_failure(fake_entry_points, caplog):
+    """A plugin whose DDL raises mid-statement has its savepoint rolled back."""
+    import logging
+    from gixen.plugins import _invoke_db_tables_isolated, load_plugins
+
+    def register_db_tables(conn):
+        conn.execute("CREATE TABLE doomed (id INTEGER PRIMARY KEY)")
+        raise RuntimeError("nope")
+
+    plug = _plugin_module("bad_plug", register_db_tables=register_db_tables)
+    fake_entry_points({"bad": plug})
+
+    pm = load_plugins()
+    conn = _conn()
+    caplog.set_level(logging.ERROR, logger="invoke-test")
+    try:
+        result = _invoke_db_tables_isolated(
+            pm, conn, logger=logging.getLogger("invoke-test")
+        )
+        assert result == []
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='doomed'"
+        ).fetchone()
+        assert row is None
+    finally:
+        conn.close()
+
+
+def test_invoke_db_tables_isolated_handles_executescript_violation(
+    fake_entry_points, caplog,
+):
+    """A plugin that calls conn.executescript() destroys the savepoint via an
+    implicit COMMIT. The inner ROLLBACK TO raises OperationalError; the helper
+    must catch the secondary failure and continue. (Regression for PER-25
+    ADV-001 / REL-01 / COR-01.)"""
+    import logging
+    from gixen.plugins import _invoke_db_tables_isolated, load_plugins
+
+    def register_db_tables(conn):
+        conn.executescript("CREATE TABLE es_bad (id INTEGER);")
+        raise RuntimeError("plugin raised after executescript")
+
+    plug = _plugin_module("es_plug", register_db_tables=register_db_tables)
+    fake_entry_points({"es-plug": plug})
+
+    pm = load_plugins()
+    conn = _conn()
+    caplog.set_level(logging.ERROR, logger="invoke-test")
+    try:
+        result = _invoke_db_tables_isolated(
+            pm, conn, logger=logging.getLogger("invoke-test")
+        )
+        assert result == []
+    finally:
+        conn.close()
+    assert any(
+        "Savepoint cleanup failed" in r.message
+        for r in caplog.records
+    )
+
+
+def test_invoke_db_tables_isolated_continues_after_one_plugin_fails(
+    fake_entry_points,
+):
+    """First plugin's DDL fails; second plugin still runs."""
+    import logging
+    from gixen.plugins import _invoke_db_tables_isolated, load_plugins
+
+    def fail(conn):
+        conn.execute("CREATE TABLE first_doomed (id INTEGER)")
+        raise RuntimeError("nope")
+
+    def ok(conn):
+        conn.execute("CREATE TABLE second_ok (id INTEGER)")
+
+    plug_a = _plugin_module("a_fail", register_db_tables=fail)
+    plug_b = _plugin_module("b_ok", register_db_tables=ok)
+    fake_entry_points({"a": plug_a, "b": plug_b})
+
+    pm = load_plugins()
+    conn = _conn()
+    try:
+        result = _invoke_db_tables_isolated(
+            pm, conn, logger=logging.getLogger("test")
+        )
+        assert result == ["b"]
+        row_doomed = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='first_doomed'"
+        ).fetchone()
+        row_ok = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='second_ok'"
+        ).fetchone()
+        assert row_doomed is None
+        assert row_ok is not None
+    finally:
+        conn.close()
+
+
+def test_invoke_register_routes_resets_openapi_on_success(fake_entry_points):
+    """openapi_schema = None runs in finally — both success and failure paths."""
+    import logging
+    from gixen.plugins import _invoke_register_routes, load_plugins
+
+    plug = _plugin_module("ok", register_routes=lambda app: None)
+    fake_entry_points({"ok": plug})
+
+    class FakeApp:
+        openapi_schema = {"cached": "stale"}
+
+    pm = load_plugins()
+    app = FakeApp()
+    _invoke_register_routes(pm, app, logger=logging.getLogger("test"))
+    assert app.openapi_schema is None
+
+
+def test_invoke_register_routes_resets_openapi_on_failure(fake_entry_points, caplog):
+    import logging
+    from gixen.plugins import _invoke_register_routes, load_plugins
+
+    def boom(app):
+        raise RuntimeError("plugin route registration blew up")
+
+    plug = _plugin_module("boom", register_routes=boom)
+    fake_entry_points({"boom": plug})
+
+    class FakeApp:
+        openapi_schema = {"cached": "stale"}
+
+    pm = load_plugins()
+    app = FakeApp()
+    caplog.set_level(logging.ERROR, logger="invoke-test")
+    _invoke_register_routes(pm, app, logger=logging.getLogger("invoke-test"))
+    assert app.openapi_schema is None
+    assert any("register_routes failed" in r.message for r in caplog.records)
+
+
+def test_collect_dashboard_tabs_flattens_lists(fake_entry_points):
+    import logging
+    from gixen.plugins import _collect_dashboard_tabs, load_plugins
+
+    def tabs():
+        return [{"slug": "alpha"}]
+
+    plug = _plugin_module("tab", register_dashboard_tabs=tabs)
+    fake_entry_points({"tab": plug})
+
+    pm = load_plugins()
+    result = _collect_dashboard_tabs(pm, logger=logging.getLogger("test"))
+    assert result == [{"slug": "alpha"}]
+
+
+def test_collect_dashboard_tabs_skips_bare_dict(fake_entry_points, caplog):
+    """Regression for PER-25 ADV-002: a plugin returning a bare dict instead
+    of a list-of-dicts must be skipped with a clear log, not iterated as keys."""
+    import logging
+    from gixen.plugins import _collect_dashboard_tabs, load_plugins
+
+    def tabs():
+        return {"slug": "wrong"}  # plugin author mistake
+
+    plug = _plugin_module("bare", register_dashboard_tabs=tabs)
+    fake_entry_points({"bare": plug})
+
+    pm = load_plugins()
+    caplog.set_level(logging.ERROR, logger="invoke-test")
+    result = _collect_dashboard_tabs(pm, logger=logging.getLogger("invoke-test"))
+    assert result == []
+    assert any(
+        "register_dashboard_tabs returned" in r.message
+        and "expected list" in r.message
+        for r in caplog.records
+    )
+
+
+def test_helpers_log_under_injected_logger_name(fake_entry_points, caplog):
+    """The whole point of the logger injection: records appear under the
+    caller's chosen logger name, so server.main's caplog tests catch them."""
+    import logging
+    from gixen.plugins import _invoke_register_routes, load_plugins
+
+    def boom(app):
+        raise RuntimeError("boom")
+
+    plug = _plugin_module("boom_logger", register_routes=boom)
+    fake_entry_points({"boom-logger": plug})
+
+    class FakeApp:
+        openapi_schema = None
+
+    pm = load_plugins()
+    caplog.set_level(logging.ERROR, logger="server.main")
+    _invoke_register_routes(pm, FakeApp(), logger=logging.getLogger("server.main"))
+    # The error record was emitted under "server.main", not "gixen.plugins".
+    server_main_records = [r for r in caplog.records if r.name == "server.main"]
+    assert any("register_routes failed" in r.message for r in server_main_records)

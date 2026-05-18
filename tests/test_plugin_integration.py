@@ -95,6 +95,83 @@ def test_no_plugins_lifespan_succeeds(make_app, monkeypatch):
         assert client.app.state.dashboard_tabs == []
 
 
+# --- app.state.db lifecycle (PER-26 Unit 1) ------------------------------------
+
+
+def test_app_state_db_is_set_during_lifespan(make_app, monkeypatch):
+    """app.state.db is the same sqlite3.Connection as server.main._db while the
+    lifespan is active."""
+    _install_plugins(monkeypatch, {})
+    with make_app() as client:
+        from server import main as server_main
+        assert isinstance(client.app.state.db, sqlite3.Connection)
+        assert client.app.state.db is server_main._db
+
+
+def test_app_state_db_cleared_after_teardown(make_app, monkeypatch):
+    """After the TestClient context exits, app.state.db is None so callers can't
+    accidentally use a closed connection."""
+    _install_plugins(monkeypatch, {})
+    with make_app() as client:
+        captured_app = client.app
+        assert captured_app.state.db is not None
+    # Outside the context: lifespan teardown ran.
+    assert captured_app.state.db is None
+
+
+def test_plugin_register_db_tables_sees_app_state_db(make_app, monkeypatch):
+    """A plugin's register_db_tables hook can read app.state.db and finds the
+    same connection it received as the conn parameter."""
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("state_db_during_ddl_plug")
+    captured = {}
+
+    @hookimpl
+    def register_db_tables(conn):
+        # Stash both connections so the test can compare after lifespan startup.
+        from server.main import app as host_app
+        captured["conn"] = conn
+        captured["app_state_db"] = host_app.state.db
+
+    mod.register_db_tables = register_db_tables
+    _install_plugins(monkeypatch, {"statedbplug": mod})
+
+    with make_app() as client:
+        assert captured["conn"] is not None
+        assert captured["app_state_db"] is captured["conn"]
+
+
+def test_plugin_route_can_use_app_state_db(make_app, monkeypatch):
+    """A plugin's route handler can read app.state.db (captured in closure from
+    the register_routes hook) and execute SQL against it. Closure-over-app is
+    the simplest plugin pattern; equivalent to request.app.state.db for internal
+    use."""
+    from gixen.plugins import hookimpl
+
+    mod = types.ModuleType("state_db_in_route_plug")
+
+    @hookimpl
+    def register_routes(app):
+        router = APIRouter()
+        host_app = app  # capture for the handler closure
+
+        @router.get("/api/fake/db-ping")
+        async def db_ping():
+            row = host_app.state.db.execute("SELECT 1").fetchone()
+            return {"ok": row[0] == 1}
+
+        app.include_router(router)
+
+    mod.register_routes = register_routes
+    _install_plugins(monkeypatch, {"dbpingplug": mod})
+
+    with make_app() as client:
+        r = client.get("/api/fake/db-ping")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+
 # --- register_routes -----------------------------------------------------------
 
 
