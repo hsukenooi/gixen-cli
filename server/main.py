@@ -14,7 +14,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
@@ -742,6 +742,11 @@ def static_v2_css():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/dashboard-tabs")
+def api_dashboard_tabs(request: Request) -> list[dict]:
+    return request.app.state.dashboard_tabs
 
 
 @app.post("/api/bids")

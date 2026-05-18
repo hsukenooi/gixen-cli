@@ -74,6 +74,7 @@ def _make_comic_schema_plugin():
     return mod
 
 
+
 def _make_mock_gixen():
     m = MagicMock()
     m.list_snipes.return_value = []
@@ -1000,3 +1001,54 @@ def test_locg_link_variant_id_preserves_when_omitted(api):
     body = r.json()
     assert body["locg_id"] == 1111
     assert body["locg_variant_id"] == 9999
+
+
+# ---------------------------------------------------------------------------
+# GET /api/dashboard-tabs (PER-28)
+# ---------------------------------------------------------------------------
+
+
+def test_api_dashboard_tabs_returns_plugin_tabs(tmp_path, monkeypatch):
+    """Tabs contributed by a plugin are returned by GET /api/dashboard-tabs."""
+    from gixen.plugins import hookimpl
+
+    tab_mod = types.ModuleType("_tab_stub")
+
+    @hookimpl
+    def register_dashboard_tabs():
+        return [{"label": "Comics", "path": "/v2/comics"}]
+
+    tab_mod.register_dashboard_tabs = register_dashboard_tabs
+    _install_plugins(monkeypatch, {"tab-stub": tab_mod})
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "tabs.db"))
+    monkeypatch.setenv("GIXEN_USERNAME", "u")
+    monkeypatch.setenv("GIXEN_PASSWORD", "p")
+    mock = _make_mock_gixen()
+    with patch("server.main.GixenClient", return_value=mock):
+        from server.main import app
+        with TestClient(app) as client:
+            r = client.get("/api/dashboard-tabs")
+    assert r.status_code == 200
+    tabs = r.json()
+    assert isinstance(tabs, list)
+    assert len(tabs) == 1
+    assert tabs[0] == {"label": "Comics", "path": "/v2/comics"}
+
+
+def test_api_dashboard_tabs_empty_without_plugins(tmp_path, monkeypatch):
+    """With no plugins installed, GET /api/dashboard-tabs returns an empty list."""
+    monkeypatch.setattr(
+        "gixen.plugins.entry_points",
+        lambda group: [],
+    )
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "empty.db"))
+    monkeypatch.setenv("GIXEN_USERNAME", "u")
+    monkeypatch.setenv("GIXEN_PASSWORD", "p")
+    mock = _make_mock_gixen()
+    with patch("server.main.GixenClient", return_value=mock):
+        from server.main import app
+        with TestClient(app) as client:
+            r = client.get("/api/dashboard-tabs")
+    assert r.status_code == 200
+    assert r.json() == []

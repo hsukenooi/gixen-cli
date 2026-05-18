@@ -157,7 +157,6 @@
 <div class="topbar">
   <div class="seg brand">▎ gixen</div>
   <a class="seg nav active" href="/">▸ snipes</a>
-  <a class="seg nav" href="/v2/comics">comics</a>
   <a class="seg nav" href="/v2/bids">bids</a>
   <div class="spacer"></div>
   <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
@@ -188,6 +187,28 @@ const params = new URLSearchParams(location.search);
 const DEMO = params.has("demo");
 const SNIPES_URL = "/api/snipes";
 const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
+
+// ---- plugin tab injection --------------------------------------------------
+// Fetches /api/dashboard-tabs at page load and inserts plugin-contributed
+// <a> elements into the topbar nav, after the hardcoded core tabs.
+(function injectPluginTabs() {
+  fetch("/api/dashboard-tabs")
+    .then(r => r.ok ? r.json() : [])
+    .then(tabs => {
+      const topbar = document.querySelector(".topbar");
+      if (!topbar || !tabs.length) return;
+      // Insert after the last core nav link (bids) and before the spacer.
+      const spacer = topbar.querySelector(".spacer");
+      for (const tab of tabs) {
+        const a = document.createElement("a");
+        a.className = "seg nav";
+        a.href = tab.path;
+        a.textContent = tab.label;
+        topbar.insertBefore(a, spacer);
+      }
+    })
+    .catch(() => {});
+})();
 
 // ---- demo fixture (used only when ?demo=1) ---------------------------------
 function demoData() {

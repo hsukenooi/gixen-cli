@@ -96,10 +96,18 @@ class GixenPluginSpec:
     def register_dashboard_tabs(self) -> list[dict]:
         """Return a list of dashboard tab specifications.
 
-        Each spec is a plain ``dict``. The exact shape is defined by PER-28
-        (which builds the dashboard renderer) — for PER-25, plugins return
-        free-form dicts that the host stores on ``app.state.dashboard_tabs``
-        without consuming them.
+        Each spec is a plain ``dict`` with the following shape (TabSpec):
+
+            {"label": str, "path": str}
+
+        ``label`` — display text shown in the nav (e.g. ``"Comics"``).
+        ``path``  — href for the nav link (e.g. ``"/v2/comics"``).
+
+        The host collects all plugin tab lists, flattens them, stores the
+        result on ``app.state.dashboard_tabs``, and exposes it via
+        ``GET /api/dashboard-tabs``. The dashboard JS fetches that endpoint
+        at page load and injects the tabs into the nav after the hardcoded
+        core tabs (snipes, bids).
         """
 
 
