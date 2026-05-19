@@ -50,3 +50,9 @@ gixen = "cli:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gixen*", "server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring real Gixen credentials (deselect with -m 'not integration')",
+]
