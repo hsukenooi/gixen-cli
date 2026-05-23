@@ -222,7 +222,9 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-def add(item_id: str, max_bid: str, offset: int, group: int):
+@click.option("--locg-id", type=int, default=None, help="LOCG comic ID for FMV linking")
+@click.option("--grade", type=float, default=None, help="Numeric grade for FMV linking")
+def add(item_id: str, max_bid: str, offset: int, group: int, locg_id: int, grade: float):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -240,6 +242,12 @@ def add(item_id: str, max_bid: str, offset: int, group: int):
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
         click.echo(f"Added snipe for {item_id} with max bid {bid}")
+        if locg_id is not None and grade is not None:
+            try:
+                _server_request("post", f"/api/bids/{item_id}/link-fmv",
+                                json={"locg_id": locg_id, "grade": grade})
+            except SystemExit:
+                click.echo("Warning: snipe added but FMV link failed", err=True)
         return
 
     # Existing direct-Gixen path
