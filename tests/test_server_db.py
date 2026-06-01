@@ -229,3 +229,129 @@ def test_bids_fmv_id_migration_is_idempotent(tmp_path):
     cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
     assert "fmv_id" in cols
     conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# PURGED -> REMOVED status rename migration (BUI-49)
+# ---------------------------------------------------------------------------
+
+# A DB created before BUI-49: the status CHECK lacks 'REMOVED' and the tombstone
+# rows are still 'PURGED'. Full current column set so column-preservation can be
+# asserted (notably fmv_id, which the FK-rebuild precedent is known to drop).
+_OLD_SCHEMA_SQL = """
+    CREATE TABLE bids (
+        id              INTEGER PRIMARY KEY,
+        item_id         TEXT NOT NULL,
+        comic_id        INTEGER,
+        max_bid         REAL NOT NULL,
+        bid_offset      INTEGER DEFAULT 6,
+        snipe_group     INTEGER DEFAULT 0,
+        status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
+        winning_bid     REAL,
+        seller          TEXT,
+        auction_end_at      TEXT,
+        local_snipe_at      TEXT,
+        local_snipe_result  TEXT,
+        notes               TEXT,
+        added_at            TEXT DEFAULT (datetime('now')),
+        resolved_at         TEXT,
+        ebay_title          TEXT,
+        status_mirror       TEXT,
+        cached_current_bid  TEXT,
+        cached_at           TEXT,
+        fmv_id              INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+"""
+
+
+def _seed_old_db(path):
+    raw = sqlite3.connect(str(path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript(_OLD_SCHEMA_SQL)
+    # A removed tombstone with a populated fmv_id + ebay_title (preservation),
+    # plus untouched non-tombstone rows.
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, fmv_id, ebay_title) "
+        "VALUES ('purged001', 50.0, 'PURGED', 12.0, 42, 'Hulk #181')"
+    )
+    raw.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('pending001', 30.0, 'PENDING')")
+    raw.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('won001', 99.0, 'WON')")
+    raw.commit()
+    raw.close()
+
+
+def test_status_rename_migration_remaps_purged_to_removed(tmp_path):
+    """On a pre-BUI-49 DB, init_db rewrites PURGED rows to REMOVED and leaves
+    non-tombstone rows untouched."""
+    db_path = tmp_path / "old.db"
+    _seed_old_db(db_path)
+
+    conn = init_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT status FROM bids WHERE item_id='purged001'"
+        ).fetchone()["status"] == "REMOVED"
+        assert conn.execute("SELECT COUNT(*) FROM bids WHERE status='PURGED'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT status FROM bids WHERE item_id='pending001'"
+        ).fetchone()["status"] == "PENDING"
+        assert conn.execute(
+            "SELECT status FROM bids WHERE item_id='won001'"
+        ).fetchone()["status"] == "WON"
+    finally:
+        conn.close()
+
+
+def test_status_rename_migration_preserves_all_columns(tmp_path):
+    """The rebuild must carry every column — guards the fmv_id-drop trap (KTD-3)."""
+    db_path = tmp_path / "old.db"
+    _seed_old_db(db_path)
+
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT max_bid, winning_bid, fmv_id, ebay_title FROM bids WHERE item_id='purged001'"
+        ).fetchone()
+        assert row["max_bid"] == 50.0
+        assert row["winning_bid"] == 12.0
+        assert row["fmv_id"] == 42
+        assert row["ebay_title"] == "Hulk #181"
+        # The column itself must still exist on the rebuilt table.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(bids)")}
+        assert "fmv_id" in cols
+    finally:
+        conn.close()
+
+
+def test_status_rename_migration_is_idempotent(tmp_path):
+    """Running init_db again on an already-migrated DB is a no-op (no error, no
+    re-migration, data intact)."""
+    db_path = tmp_path / "old.db"
+    _seed_old_db(db_path)
+    conn = init_db(db_path)
+    conn.close()
+
+    conn2 = init_db(db_path)
+    try:
+        assert conn2.execute(
+            "SELECT status FROM bids WHERE item_id='purged001'"
+        ).fetchone()["status"] == "REMOVED"
+        assert conn2.execute("SELECT COUNT(*) FROM bids").fetchone()[0] == 3
+    finally:
+        conn2.close()
+
+
+def test_removed_status_accepted_after_migration(tmp_path):
+    """Post-migration, the CHECK accepts an explicit REMOVED insert."""
+    db_path = tmp_path / "old.db"
+    _seed_old_db(db_path)
+    conn = init_db(db_path)
+    try:
+        conn.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('r1', 1.0, 'REMOVED')")
+        conn.commit()
+        assert conn.execute(
+            "SELECT status FROM bids WHERE item_id='r1'"
+        ).fetchone()["status"] == "REMOVED"
+    finally:
+        conn.close()
