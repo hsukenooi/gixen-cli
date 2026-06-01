@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> **Development has moved into the [comic-pipeline](https://github.com/hsukenooi/comic-pipeline) monorepo.**
+> This repository is archived (read-only). gixen-cli now lives at
+> [`packages/gixen-cli/`](https://github.com/hsukenooi/comic-pipeline/tree/main/packages/gixen-cli)
+> with its full history preserved. The pre-archive state is tagged `pre-monorepo-archive`.
+
 # Gixen CLI
 
 [![CI](https://github.com/hsukenooi/gixen-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/hsukenooi/gixen-cli/actions/workflows/tests.yml)
