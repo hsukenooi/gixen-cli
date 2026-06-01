@@ -256,7 +256,7 @@ def update_bid_status(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
         "auction_end_at=COALESCE(auction_end_at, ?), "
         "status_mirror=COALESCE(?, status_mirror) "
-        "WHERE item_id=? AND status NOT IN ('PURGED')",
+        "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
         (status, winning_bid, resolved_at, resolved_at, status_mirror, item_id),
     )
 
@@ -290,15 +290,17 @@ def cache_gixen_data(
         "seller=COALESCE(?, seller), "
         "cached_current_bid=COALESCE(?, cached_current_bid), "
         "cached_at=? "
-        "WHERE item_id=? AND status NOT IN ('PURGED')",
+        "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
         (title, seller, current_bid, now, item_id),
     )
 
 
 def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    # Soft-delete tombstone. Renamed PURGED -> REMOVED in BUI-49; skip rows that
+    # already carry either tombstone value so we don't re-stamp resolved_at.
     conn.execute(
-        "UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
+        "UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
         (now, item_id),
     )
     conn.commit()
@@ -318,8 +320,9 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     # placeholders contains only '?' chars — no user data is interpolated
     placeholders = ",".join("?" * len(item_ids))
+    # Tombstone completed bids. Renamed PURGED -> REMOVED in BUI-49.
     conn.execute(
-        f"UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id IN ({placeholders})",
+        f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id IN ({placeholders})",
         [now, *item_ids],
     )
     conn.commit()

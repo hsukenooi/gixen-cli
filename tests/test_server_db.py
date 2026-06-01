@@ -84,7 +84,7 @@ def test_delete_bid_marks_purged(db):
     insert_bid(db, "555444333", 30.0, 6, 0, "s")
     delete_bid(db, "555444333")
     row = get_bid_by_item_id(db, "555444333")
-    assert row["status"] == "PURGED"
+    assert row["status"] == "REMOVED"
 
 
 def test_delete_bid_marks_won_bid_purged(db):
@@ -92,7 +92,7 @@ def test_delete_bid_marks_won_bid_purged(db):
     update_bid_status(db, "666777888", status="WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
     delete_bid(db, "666777888")
     row = get_bid_by_item_id(db, "666777888")
-    assert row["status"] == "PURGED"
+    assert row["status"] == "REMOVED"
 
 
 def test_get_all_bids_returns_list(db):
@@ -110,8 +110,8 @@ def test_mark_bids_purged_sets_status(db):
     mark_bids_purged(db, ["200000001", "200000002"])
     row1 = get_bid_by_item_id(db, "200000001")
     row2 = get_bid_by_item_id(db, "200000002")
-    assert row1["status"] == "PURGED"
-    assert row2["status"] == "PURGED"
+    assert row1["status"] == "REMOVED"
+    assert row2["status"] == "REMOVED"
     assert row1["resolved_at"] is not None
 
 
@@ -120,7 +120,7 @@ def test_mark_bids_purged_transitions_won_bid(db):
     update_bid_status(db, "200000003", "WON", winning_bid=42.0, resolved_at="2026-04-25T10:00:00")
     mark_bids_purged(db, ["200000003"])
     row = get_bid_by_item_id(db, "200000003")
-    assert row["status"] == "PURGED"
+    assert row["status"] == "REMOVED"
     assert row["winning_bid"] == 42.0
 
 
