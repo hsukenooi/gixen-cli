@@ -575,9 +575,13 @@ def test_history_deduplicates_by_item_id(api):
     multiple rows for the same item (e.g. after a purge-and-re-add cycle)."""
     import os
     import sqlite3 as _sqlite3
+    from datetime import datetime, timedelta, timezone
 
     db_path = os.getenv("DB_PATH")
-    yesterday = "2026-05-18T10:00:00"
+    # Must fall inside /api/history's 7-day window. Computed relative to now so
+    # it can't age out — a previously hardcoded literal date silently rotted
+    # past the window and turned this into a time-bomb failure.
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     # Open a separate connection to seed duplicate rows directly.
     # Intentionally seeds the legacy 'PURGED' tombstone (not 'REMOVED') to
     # verify gixen-cli's /api/history still tolerates pre-BUI-49 values.
